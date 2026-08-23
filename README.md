@@ -106,9 +106,9 @@ Ao mandar qualquer mensagem privada para o bot, ele exibirá um tutorial de ajud
 | Comando | Onde Usar | Descrição |
 | --- | --- | --- |
 | `!config` | DM | Inicia o assistente de configuração de sala. |
-| `!sair <ID_VOZ>` | DM | Desconecta o bot de um canal de voz específico. |
+| `!sair` | Servidor | Desconecta o bot de um canal de voz. |
 | `!master <SENHA>` | DM | Força o bot a sair de todas as chamadas ativas. |
-| `!play <LINK>` / `!tocar <LINK>` | Servidor | Adiciona uma música ou rádio à fila. |
+| `!play <LINK/NOME>` / `!tocar <LINK>` | Servidor | Adiciona uma música ou rádio à fila. |
 | `!skip` / `!pular` | Servidor | Pula a música/rádio que está tocando. |
 | `!fila` / `!queue` | Servidor | Exibe a lista das próximas 10 faixas. |
 | `!stop` / `!parar` | Servidor | Para a reprodução imediatamente e limpa a fila. |
