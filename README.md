@@ -109,6 +109,11 @@ Ao mandar qualquer mensagem privada para o bot, ele exibirá um tutorial de ajud
 | `!sair` | Servidor | Desconecta o bot de um canal de voz. |
 | `!master <SENHA>` | DM | Força o bot a sair de todas as chamadas ativas. |
 | `!play <LINK/NOME>` / `!tocar <LINK>` | Servidor | Adiciona uma música ou rádio à fila. |
+para rodar play lista mande assim:
+!play
+https://youtu.be/csfakKPxtVs?si=eenldU4UpIzhCQMU
+https://youtu.be/zXQZGA6MhJA?si=p9Mwf7YuDAxe542R
+https://youtu.be/MPBtNkkgwCk?si=CBTlqDZrZyNIY3z4
 | `!skip` / `!pular` | Servidor | Pula a música/rádio que está tocando. |
 | `!fila` / `!queue` | Servidor | Exibe a lista das próximas 10 faixas. |
 | `!stop` / `!parar` | Servidor | Para a reprodução imediatamente e limpa a fila. |
