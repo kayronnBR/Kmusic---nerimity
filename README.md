@@ -94,11 +94,6 @@ Execute o script utilizando o Python do seu ambiente virtual:
 ### 1. Configuração Inicial (Na DM do Bot)
 
 Ao mandar qualquer mensagem privada para o bot, ele exibirá um tutorial de ajuda.
-
-1. Envie `!config` na conversa privada (DM) do bot.
-2. Envie o **ID do Canal de Texto** onde os comandos de música serão digitados.
-3. Envie o **ID do Canal de Voz** onde o bot deve entrar.
-
 ---
 
 ### 2. Comandos do Bot
