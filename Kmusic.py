@@ -25,6 +25,7 @@ o `ContinuousAudioTrack`.
 import asyncio
 import fractions
 import os
+import re
 import tempfile
 import threading
 import time
@@ -56,6 +57,9 @@ SENHA_MESTRE = "SUA_SENHA_AQUI"
 USUARIOS_BLOQUEADOS = set()
 
 PEER_CONNECT_TIMEOUT = 20
+
+# Limite máximo de músicas que podem ser adicionadas de uma vez via !play/!playlist
+LIMITE_PLAYLIST = 50
 
 # Pasta temporária para armazenamento local do áudio
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "kmusic_cache")
@@ -94,6 +98,16 @@ ICE_SERVERS = [
 ]
 
 bot = Bot(token=TOKEN)
+
+
+def extrair_links_da_lista(texto: str) -> List[str]:
+    """
+    Extrai, em ordem, todos os links de uma mensagem de playlist personalizada
+    (um link por linha, ou vários separados por espaço/vírgula). Linhas que
+    não são links (títulos, comentários, numeração "1.", etc.) são ignoradas.
+    """
+    candidatos = re.split(r'[\s,]+', texto.strip())
+    return [c for c in candidatos if c.startswith(('http://', 'https://'))]
 
 
 class AudioFileSource:
@@ -226,6 +240,15 @@ class VoiceSession:
         self.fila: List[str] = []
         self.current_track: Optional[AudioFileSource] = None
         self.current_file_path: Optional[str] = None
+        # ID do canal de TEXTO configurado, para poder avisar sobre o que
+        # está tocando/fila. Setado pela GerenciadorSalas logo após a
+        # criação da sessão.
+        self.canal_texto_id: Optional[str] = None
+        # Evita repetir o aviso de "fila acabou" a cada segundo enquanto
+        # o bot fica ocioso esperando novas músicas, e evita mandar esse
+        # aviso logo ao entrar no canal, antes de tocar qualquer coisa.
+        self._avisou_fila_vazia = False
+        self._ja_tocou_alguma_musica = False
         # Sinaliza (para a thread de download do yt-dlp) que o download
         # em andamento deve ser cancelado — setado por !skip/!stop/!sair.
         self._cancelar_evento = threading.Event()
@@ -296,6 +319,15 @@ class VoiceSession:
             except Exception:
                 pass
 
+    async def _enviar_texto(self, texto: str) -> None:
+        """Envia um aviso no canal de texto configurado (se houver)."""
+        if not self.canal_texto_id:
+            return
+        try:
+            await self.bot.rest.create_message(self.canal_texto_id, texto)
+        except Exception as e:
+            print(f"Aviso: não foi possível enviar mensagem no canal de texto: {e}")
+
     async def _baixar_audio_local(self, url: str):
         """Baixa o arquivo de áudio completo antes de iniciar a reprodução."""
         loop = asyncio.get_event_loop()
@@ -359,38 +391,61 @@ class VoiceSession:
             print(f"Erro ao extrair informações ({url}): {e}")
             return None
 
+    # Extensões de arquivo de áudio direto: tocamos via streaming (sem
+    # baixar primeiro) para começar a tocar mais rápido — o av.open lê
+    # direto da URL remota, igual faz com os links de rádio.
+    EXTENSOES_ARQUIVO_FINITO = ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.opus', '.wma')
+
     async def _play_loop(self):
         """Loop principal de reprodução da fila."""
         while True:
             if not self.fila or self.current_track is not None:
+                if (
+                    not self.fila
+                    and self.current_track is None
+                    and self._ja_tocou_alguma_musica
+                    and not self._avisou_fila_vazia
+                ):
+                    self._avisou_fila_vazia = True
+                    await self._enviar_texto("🏁 A fila acabou! Manda mais música com `!play`.")
                 await asyncio.sleep(1)
                 continue
 
+            self._avisou_fila_vazia = False
             link_usuario = self.fila.pop(0)
+            url_sem_query = link_usuario.split('?')[0].lower()
+            titulo_stream = None
 
-            info = await self._extrair_info(link_usuario)
-
-            if info is not None:
-                # Se o yt-dlp não retorna duração, ou marca como live_status,
-                # é uma transmissão contínua/infinita (rádio) — não pode
-                # (nem faz sentido) ser baixada por completo.
-                eh_ao_vivo = (
-                    bool(info.get('is_live'))
-                    or info.get('live_status') in ('is_live', 'is_upcoming', 'post_live')
-                    or not info.get('duration')
-                )
+            if url_sem_query.endswith(self.EXTENSOES_ARQUIVO_FINITO):
+                # Link direto para um arquivo de áudio: streama sem baixar.
+                info = None
+                eh_ao_vivo = True
+                titulo_stream = os.path.basename(url_sem_query) or "Arquivo de Áudio"
             else:
-                # yt-dlp não conseguiu extrair metadados: provavelmente é
-                # uma URL de stream de áudio puro sem suporte específico.
-                # Cai na heurística por extensão como último recurso.
-                eh_ao_vivo = (
-                    link_usuario.endswith(('.m3u', '.m3u8', '.pls', '.aac'))
-                    or ":80" in link_usuario
-                )
+                info = await self._extrair_info(link_usuario)
+
+                if info is not None:
+                    # Se o yt-dlp não retorna duração, ou marca como
+                    # live_status, é uma transmissão contínua/infinita
+                    # (rádio) — não pode (nem faz sentido) ser baixada.
+                    eh_ao_vivo = (
+                        bool(info.get('is_live'))
+                        or info.get('live_status') in ('is_live', 'is_upcoming', 'post_live')
+                        or not info.get('duration')
+                    )
+                else:
+                    # yt-dlp não conseguiu extrair metadados: provavelmente
+                    # é uma URL de stream de áudio puro sem suporte
+                    # específico. Cai na heurística por extensão como
+                    # último recurso.
+                    eh_ao_vivo = (
+                        link_usuario.endswith(('.m3u', '.m3u8', '.pls', '.aac'))
+                        or ":80" in link_usuario
+                    )
 
             if eh_ao_vivo:
                 caminho_ou_url = (info.get('url') if info else None) or link_usuario
-                titulo = (info.get('title') if info else None) or "Rádio Ao Vivo"
+                titulo = (info.get('title') if info else None) or titulo_stream or "Rádio Ao Vivo"
                 eh_temporario = False
             else:
                 caminho_ou_url, titulo = await self._baixar_audio_local(link_usuario)
@@ -404,7 +459,9 @@ class VoiceSession:
                 self.current_track = AudioFileSource(caminho_ou_url, loop)
                 if eh_temporario:
                     self.current_file_path = caminho_ou_url
+                self._ja_tocou_alguma_musica = True
                 print(f"▶️ Tocando: {titulo}")
+                await self._enviar_texto(f"▶️ Tocando agora: **{titulo}**")
             except Exception as e:
                 print(f"Erro ao carregar o arquivo de áudio: {e}")
                 self.finalizar_musica_atual()
@@ -550,8 +607,7 @@ class VoiceSession:
 
 
 class ConfigState:
-    AGUARDANDO_TEXTO = "aguardando_texto"
-    AGUARDANDO_VOZ = "aguardando_voz"
+    AGUARDANDO_MODELO = "aguardando_modelo"
 
 class Sala:
     def __init__(self, canal_texto_id: str, canal_voz_id: str, voice_session: "VoiceSession"):
@@ -563,8 +619,7 @@ class FluxoConfig:
     def __init__(self, dm_channel_id: str, user_id: str):
         self.dm_channel_id = dm_channel_id
         self.user_id = user_id
-        self.estado = ConfigState.AGUARDANDO_TEXTO
-        self.canal_texto_id: Optional[str] = None
+        self.estado = ConfigState.AGUARDANDO_MODELO
 
 class GerenciadorSalas:
     def __init__(self, bot: Bot):
@@ -584,44 +639,68 @@ class GerenciadorSalas:
     def sala_por_canal_voz(self, canal_voz_id: str) -> Optional[Sala]:
         return self.salas_por_voz.get(canal_voz_id)
 
+    def _extrair_ids_do_modelo(self, texto: str):
+        """Extrai 'ID TEXTO: ...' e 'ID VOZ: ...' de um texto preenchido pelo usuário."""
+        match_texto = re.search(r'ID\s*TEXTO\s*:\s*(\S+)', texto, re.IGNORECASE)
+        match_voz = re.search(r'ID\s*VOZ\s*:\s*(\S+)', texto, re.IGNORECASE)
+        canal_texto_id = match_texto.group(1).strip() if match_texto else None
+        canal_voz_id = match_voz.group(1).strip() if match_voz else None
+        return canal_texto_id, canal_voz_id
+
     async def iniciar_config(self, dm_channel_id: str, user_id: str) -> None:
         self.fluxos[dm_channel_id] = FluxoConfig(dm_channel_id, user_id)
-        await self._enviar_dm(dm_channel_id, "🎵 Configuração iniciada!\nMe envie o **ID do canal de TEXTO** onde usará os comandos (!play, !skip).")
+        await self._enviar_dm(
+            dm_channel_id,
+            "👋 Olá! Sou o Bot de Música do Nerimity.\n\n"
+            "Preencha o modelo abaixo com os IDs e me envie de volta:\n\n"
+            "```\nID TEXTO: \nID VOZ: \n```"
+        )
+
+    async def _concluir_configuracao(
+        self, dm_channel_id: str, user_id: str, canal_texto_id: str, canal_voz_id: str
+    ) -> None:
+        voice_session = VoiceSession(self.bot, canal_voz_id)
+        voice_session.my_user_id = self.my_user_id
+        voice_session.canal_texto_id = canal_texto_id
+        try:
+            await voice_session.join()
+        except Exception as exc:
+            await self._enviar_dm(dm_channel_id, f"❌ Erro ao entrar no canal de voz: {exc}. Verifique o ID.")
+            return
+
+        sala = Sala(canal_texto_id, canal_voz_id, voice_session)
+        self.salas_por_texto[canal_texto_id] = sala
+        self.salas_por_voz[canal_voz_id] = sala
+        self.fluxos.pop(dm_channel_id, None)
+
+        await self._enviar_dm(
+            dm_channel_id,
+            "🎉 Pronto!\n\nNo canal de texto configurado, utilize:\n"
+            "• `!play [URL/Link]` - Toca músicas, lives ou rádios\n"
+            "• `!play` com vários links (um por linha) ou `!playlist` - Toca uma playlist personalizada, em ordem\n"
+            "• `!skip` - Pula a música atual\n"
+            "• `!fila` - Exibe as próximas músicas\n"
+            "• `!stop` - Limpa a fila e desliga a música\n"
+            "• `!sair` - Tira o bot do canal de voz"
+        )
 
     async def processar_resposta_dm(self, dm_channel_id: str, texto: str) -> None:
         fluxo = self.fluxos.get(dm_channel_id)
         if not fluxo: return
-        texto = (texto or "").strip()
+        texto_original = texto or ""
+        texto = texto_original.strip()
         if not texto: return
 
-        if fluxo.estado == ConfigState.AGUARDANDO_TEXTO:
-            fluxo.canal_texto_id = texto
-            fluxo.estado = ConfigState.AGUARDANDO_VOZ
-            await self._enviar_dm(dm_channel_id, "🎙️ Perfeito! Agora mande o **ID do canal de VOZ** para o bot entrar.")
-
-        elif fluxo.estado == ConfigState.AGUARDANDO_VOZ:
-            voice_session = VoiceSession(self.bot, texto)
-            voice_session.my_user_id = self.my_user_id
-            try:
-                await voice_session.join()
-            except Exception as exc:
-                await self._enviar_dm(dm_channel_id, f"❌ Erro ao entrar no canal de voz: {exc}. Verifique o ID.")
+        if fluxo.estado == ConfigState.AGUARDANDO_MODELO:
+            canal_texto_id, canal_voz_id = self._extrair_ids_do_modelo(texto_original)
+            if not canal_texto_id or not canal_voz_id:
+                await self._enviar_dm(
+                    dm_channel_id,
+                    "⚠️ Não consegui encontrar os dois IDs preenchidos. Envie novamente no formato:\n\n"
+                    "```\nID TEXTO: 123456\nID VOZ: 654321\n```"
+                )
                 return
-
-            sala = Sala(fluxo.canal_texto_id, texto, voice_session)
-            self.salas_por_texto[fluxo.canal_texto_id] = sala
-            self.salas_por_voz[texto] = sala
-            del self.fluxos[dm_channel_id]
-
-            await self._enviar_dm(
-                dm_channel_id,
-                "🎉 Pronto!\n\nNo canal de texto configurado, utilize:\n"
-                "• `!play [URL/Link]` - Toca músicas, lives ou rádios\n"
-                "• `!skip` - Pula a música atual\n"
-                "• `!fila` - Exibe as próximas músicas\n"
-                "• `!stop` - Limpa a fila e desliga a música\n"
-                "• `!sair` - Tira o bot do canal de voz"
-            )
+            await self._concluir_configuracao(dm_channel_id, fluxo.user_id, canal_texto_id, canal_voz_id)
 
     async def sair_da_sala(self, dm_channel_id: str, canal_voz_id: str) -> None:
         sala = self.salas_por_voz.pop(canal_voz_id, None)
@@ -701,26 +780,61 @@ async def on_message(event):
             await gerenciador.iniciar_config(channel_id, autor_id)
             return
 
+        # Se a mensagem já vem com os dois IDs preenchidos (o modelo
+        # "ID TEXTO: ... / ID VOZ: ..."), configura direto, mesmo que a
+        # pessoa não tenha pedido !config antes nem esteja num fluxo ativo.
+        canal_texto_id, canal_voz_id = gerenciador._extrair_ids_do_modelo(conteudo)
+        if canal_texto_id and canal_voz_id:
+            gerenciador.fluxos.pop(channel_id, None)
+            await gerenciador._concluir_configuracao(channel_id, autor_id, canal_texto_id, canal_voz_id)
+            return
+
         if channel_id in gerenciador.fluxos:
             await gerenciador.processar_resposta_dm(channel_id, conteudo)
             return
 
-        tutorial = (
-            "👋 Olá! Sou o Bot de Música do Nerimity.\n\n"
-            f"🛠️ Para me colocar na sua chamada de voz, envie a mensagem `{COMANDO_CONFIG}` aqui na minha DM."
-        )
-        await gerenciador._enviar_dm(channel_id, tutorial)
+        # Qualquer outra mensagem em DM já inicia a configuração
+        # automaticamente — não precisa mais digitar !config.
+        await gerenciador.iniciar_config(channel_id, autor_id)
         return
 
     # -- SERVIDOR --
     sala = gerenciador.sala_por_canal_texto(channel_id)
     if sala:
-        if comando in ["!play", "!tocar"]:
+        if comando in ["!play", "!tocar", "!playlist", "!lista"]:
             if argumento:
-                sala.voice_session.adicionar_musica(argumento)
-                await bot.rest.create_message(channel_id, "🎶 Adicionado à fila! Baixando e iniciando áudio...")
+                links = extrair_links_da_lista(argumento)
+                if not links:
+                    # Não veio nenhum link reconhecível (ex: começa sem
+                    # "http") — trata a mensagem inteira como um único
+                    # pedido (ex: busca por nome de música).
+                    links = [argumento.strip()]
+
+                cortado = len(links) > LIMITE_PLAYLIST
+                if cortado:
+                    links = links[:LIMITE_PLAYLIST]
+
+                for link in links:
+                    sala.voice_session.adicionar_musica(link)
+
+                if len(links) > 1:
+                    aviso_corte = f" (limite de {LIMITE_PLAYLIST} por vez, o restante foi ignorado)" if cortado else ""
+                    await bot.rest.create_message(
+                        channel_id,
+                        f"🎶 {len(links)} músicas adicionadas à fila, na ordem enviada!{aviso_corte} "
+                        "Vai começar a tocar em instantes, aguarde um pouco 🙂"
+                    )
+                else:
+                    await bot.rest.create_message(
+                        channel_id,
+                        "🎶 Adicionado à fila! Vai começar a tocar em instantes, aguarde um pouco 🙂"
+                    )
             else:
-                await bot.rest.create_message(channel_id, "⚠️ Informe um link válido (YouTube, SoundCloud, Rádio ou Arquivo de Áudio).")
+                await bot.rest.create_message(
+                    channel_id,
+                    "⚠️ Informe um link válido (YouTube, SoundCloud, Rádio ou Arquivo de Áudio).\n"
+                    "Dica: para tocar uma playlist personalizada, mande vários links, um por linha, depois de `!play`."
+                )
 
         elif comando in ["!skip", "!pular"]:
             sala.voice_session.pular_musica()
