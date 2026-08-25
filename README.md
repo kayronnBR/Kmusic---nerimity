@@ -1,13 +1,13 @@
 # 🎵 Kmusic - Bot de Música para Nerimity
 
-O **Kmusic** é um bot de música e rádio para a plataforma Nerimity. Ele utiliza a biblioteca `aiortc` para comunicação WebRTC de baixa latência e o `yt-dlp` para extrair e reproduzir áudio de centenas de plataformas e transmissões de rádio ao vivo.
+O **Kmusic** é um bot de música e rádio para a plataforma Nerimity. Ele utiliza a biblioteca `aiortc` para comunicação WebRTC de baixa latência.
 
 ---
 
 ## ⚡ Recursos
 
 * **Configuração simplificada por DM:** Vincule canais de texto e voz enviando uma mensagem no privado do bot.
-* **Amplo suporte a mídias:** Suporta YouTube, SoundCloud, Twitch, rádios ao vivo e links diretos de áudio.
+* **Amplo suporte a mídias:** escute musicas do Google drive, Dropbox, rádio online, .mp3, .ogg e outros formatos de áudio
 * **Transmissão WebRTC Contínua:** Mantém a conexão de áudio estável mesmo durante a troca de músicas.
 * **Controle total de fila:** Comandos para adicionar, pular, limpar a fila e visualizar as próximas faixas.
 
@@ -19,11 +19,8 @@ Como o bot utiliza o **yt-dlp** e decodificação via FFmpeg, ele é compatível
 
 | Plataforma / Tipo | Conteúdos Suportados |
 | :--- | :--- |
-| **YouTube** | Vídeos, Lives / Rádios 24/7 e Shorts |
-| **SoundCloud** | Faixas individuais, Álbuns e Sets |
-| **Twitch** | Transmissões ao vivo (Livestreams) |
-| **Bandcamp & Mixcloud** | Músicas, Sets de DJ e Podcasts |
-| **Vimeo & Dailymotion** | Vídeos e conteúdos em áudio |
+| **Google drive** | pasta de música ou link separado|
+| **Dropbox** | consegue reproduzir 1 arquivo por ver sem possibilidade de playlist automático|
 | **Rádios Web (Icecast / Shoutcast)** | Fluxos contínuos (`.m3u`, `.pls`, portas `:8000`, etc.) |
 | **Arquivos Diretos de Áudio** | Links diretos terminados em `.mp3`, `.aac`, `.ogg`, `.flac`, `.wav` |
 
@@ -34,12 +31,7 @@ Como o bot utiliza o **yt-dlp** e decodificação via FFmpeg, ele é compatível
 Antes de iniciar, certifique-se de ter instalado em seu sistema:
 
 1. **Python 3.10+**
-2. **FFmpeg** (Obrigatório para o processamento de áudio via `av` e `yt-dlp`).
 
-### Instalação do FFmpeg (Linux / Debian / Ubuntu):
-```bash
-sudo apt update
-sudo apt install ffmpeg -y
 
 ```
 
@@ -58,7 +50,7 @@ python3 -m venv ~/venv
 
 2. **Instale as dependências:**
 ```bash
-~/venv/bin/pip install aiortc av numpy nerimity_sdk yt-dlp
+~/venv/bin/pip install aiortc av numpy nerimity_sdk
 
 ```
 
@@ -105,13 +97,12 @@ Ao mandar qualquer mensagem privada para o bot, ele exibirá um tutorial de ajud
 | `!master <SENHA>` | DM | Força o bot a sair de todas as chamadas ativas. |
 | `!play <LINK/NOME>` / `!tocar <LINK>` | Servidor | Adiciona uma música ou rádio à fila. |
 para rodar play lista mande assim:
-!play
-https://youtu.be/csfakKPxtVs?si=eenldU4UpIzhCQMU
-https://youtu.be/zXQZGA6MhJA?si=p9Mwf7YuDAxe542R
-https://youtu.be/MPBtNkkgwCk?si=CBTlqDZrZyNIY3z4
+!play LINK-DA-PASTA-DO-GOOGLE-DRIVE
+ele vai puxar das as músicas, se passa de 50 ele não pega o resto por conta do limite
 | `!skip` / `!pular` | Servidor | Pula a música/rádio que está tocando. |
 | `!fila` / `!queue` | Servidor | Exibe a lista das próximas 10 faixas. |
 | `!stop` / `!parar` | Servidor | Para a reprodução imediatamente e limpa a fila. |
+| `!extrair` / | DM | coloque o link da pasta de músicas suas no comando e ele vai manda a lista completa |
 
 ---
 
