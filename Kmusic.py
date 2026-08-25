@@ -1,17 +1,16 @@
 """
 Bot de Música Ultra Leve para Nerimity.
-Focado em Streaming Direto, Rádios, Google Drive (Arquivos e Pastas) e Dropbox.
-Possui comando !extrair na DM para gerar arquivos .txt com listas de links.
+Mensagens simplificadas de reprodução e aviso de conexão no !play.
 """
 
 import asyncio
 import fractions
 import gc
-import io
 import re
 import time
+import urllib.parse
 import urllib.request
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, TypedDict
 
 import av
 import numpy as np
@@ -28,7 +27,7 @@ from aiortc.sdp import candidate_from_sdp
 from nerimity_sdk import Bot
 
 # --- CONFIGURAÇÕES ---
-TOKEN = "COLOQUE-TOKEN-AQUI"
+TOKEN = "SEU_TOKEN_DO_BOT_AQUI"
 
 COMANDO_CONFIG = "!config"
 COMANDO_SAIR = "!sair"
@@ -38,7 +37,7 @@ SENHA_MESTRE = "SUA_SENHA_AQUI"
 USUARIOS_BLOQUEADOS = set()
 
 PEER_CONNECT_TIMEOUT = 15
-LIMITE_PLAYLIST = 50  # Limite máximo de músicas tocadas por vez na fila
+LIMITE_PLAYLIST = 50
 
 ICE_SERVERS = [
     RTCIceServer(urls="stun:stun.l.google.com:19302"),
@@ -53,51 +52,72 @@ ICE_SERVERS = [
 bot = Bot(token=TOKEN)
 
 
+class ItemMusica(TypedDict):
+    url: str
+
+
 def _obter_html_gdrive(folder_id: str) -> str:
-    """Faz a requisição HTTP leve para a pasta do Google Drive."""
     url = f"https://drive.google.com/embeddedfolderview?id={folder_id}"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=10) as response:
+    req = urllib.request.Request(
+        url, 
+        headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
         return response.read().decode('utf-8', errors='ignore')
 
 
-async def extrair_todos_links_gdrive(candidato: str) -> List[str]:
-    """Varre uma pasta do Google Drive e devolve TODOS os links sem limite."""
+async def extrair_todos_links_gdrive(candidato: str) -> List[ItemMusica]:
     match_pasta = re.search(r'folders/([a-zA-Z0-9_-]+)', candidato)
     if not match_pasta:
         return []
     folder_id = match_pasta.group(1)
+    
     try:
         html = await asyncio.to_thread(_obter_html_gdrive, folder_id)
-        ids = re.findall(r'/file/d/([a-zA-Z0-9_-]+)', html)
-        ids_unicos = list(dict.fromkeys(ids))
-        return [f"https://drive.google.com/uc?export=download&id={fid}" for fid in ids_unicos]
+        resultado: List[ItemMusica] = []
+        vistos = set()
+
+        padrao_json = r'\["([a-zA-Z0-9_-]{25,})"'
+        for fid in re.findall(padrao_json, html):
+            if fid not in vistos:
+                vistos.add(fid)
+                resultado.append({"url": f"https://drive.google.com/uc?export=download&id={fid}"})
+
+        if not resultado:
+            padrao_generico = r'/file/d/([a-zA-Z0-9_-]+)'
+            ids = list(dict.fromkeys(re.findall(padrao_generico, html)))
+            for fid in ids:
+                resultado.append({"url": f"https://drive.google.com/uc?export=download&id={fid}"})
+
+        return resultado
     except Exception as e:
         print(f"Erro ao ler pasta do Drive: {e}")
         return []
 
 
-async def extrair_links_da_lista(texto: str) -> List[str]:
-    """Extrai e converte links individuais e pastas (para uso no !play)."""
+async def extrair_links_da_lista(texto: str) -> List[ItemMusica]:
     candidatos = re.split(r'[\s,]+', texto.strip())
-    links_prontos = []
+    links_prontos: List[ItemMusica] = []
     
     for c in candidatos:
         if c.startswith(('http://', 'https://')):
             if "drive.google.com" in c and "folders/" in c:
-                links_pasta = await extrair_todos_links_gdrive(c)
-                links_prontos.extend(links_pasta)
+                itens = await extrair_todos_links_gdrive(c)
+                links_prontos.extend(itens)
             elif "drive.google.com/file/d/" in c:
                 match = re.search(r'/d/([a-zA-Z0-9_-]+)', c)
                 if match:
-                    links_prontos.append(f"https://drive.google.com/uc?export=download&id={match.group(1)}")
+                    fid = match.group(1)
+                    links_prontos.append({"url": f"https://drive.google.com/uc?export=download&id={fid}"})
             elif "dropbox.com" in c:
-                c = c.replace("?dl=0", "?dl=1")
-                if "&dl=1" not in c and "?dl=1" not in c:
-                    c += "&dl=1" if "?" in c else "?dl=1"
-                links_prontos.append(c)
+                url_final = c.replace("?dl=0", "?dl=1")
+                if "&dl=1" not in url_final and "?dl=1" not in url_final:
+                    url_final += "&dl=1" if "?" in url_final else "?dl=1"
+                links_prontos.append({"url": url_final})
             else:
-                links_prontos.append(c)
+                links_prontos.append({"url": c})
             
     return links_prontos
 
@@ -195,7 +215,7 @@ class VoiceSession:
         self.tracks: Dict[str, ContinuousAudioTrack] = {}
         self._connected = False
 
-        self.fila: List[str] = []
+        self.fila: List[ItemMusica] = []
         self.current_track: Optional[AudioFileSource] = None
         self.canal_texto_id: Optional[str] = None
         self._avisou_fila_vazia = False
@@ -224,8 +244,8 @@ class VoiceSession:
             await self.bot.rest.leave_voice(self.channel_id)
             self._connected = False
 
-    def adicionar_musica(self, url: str):
-        self.fila.append(url)
+    def adicionar_musica(self, item: ItemMusica):
+        self.fila.append(item)
 
     def finalizar_musica_atual(self):
         if self.current_track:
@@ -261,18 +281,18 @@ class VoiceSession:
                     and not self._avisou_fila_vazia
                 ):
                     self._avisou_fila_vazia = True
-                    await self._enviar_texto("🏁 A fila acabou! Mande mais links ou pastas de áudio.")
+                    await self._enviar_texto("🏁 Fila finalizada!")
                 await asyncio.sleep(1)
                 continue
 
             self._avisou_fila_vazia = False
-            link_usuario = self.fila.pop(0)
+            musica_atual = self.fila.pop(0)
 
             try:
                 loop = asyncio.get_running_loop()
-                self.current_track = AudioFileSource(link_usuario, loop)
+                self.current_track = AudioFileSource(musica_atual["url"], loop)
                 self._ja_tocou_alguma_musica = True
-                await self._enviar_texto(f"▶️ Tentando sintonizar:\n`{link_usuario[:80]}...`")
+                await self._enviar_texto("▶️ **Tocando próxima música...**")
             except Exception as e:
                 print(f"Erro ao carregar áudio: {e}")
                 self.finalizar_musica_atual()
@@ -449,43 +469,10 @@ class GerenciadorSalas:
         self.fluxos[dm_channel_id] = FluxoConfig(dm_channel_id, user_id)
         await self._enviar_dm(
             dm_channel_id,
-            "👋 Olá! Sou o Bot de Música (Modo Leve).\n\n"
-            "Preencha o modelo abaixo com os IDs e me envie de volta:\n\n"
-            "```\nID TEXTO: \nID VOZ: \n```\n"
-            "💡 *Dica:* Para organizar uma pasta grande do Drive, envie `!extrair <link_da_pasta>`."
+            "👋 **Bot de Música Simplificado**\n\n"
+            "⚙️ **Para conectar o bot ao servidor**, envie o modelo preenchido:\n"
+            "```\nID TEXTO: \nID VOZ: \n```"
         )
-
-    async def processar_comando_extrair(self, dm_channel_id: str, argumento: str) -> None:
-        """Processa a extração de pastas grandes e envia a lista formatada no chat."""
-        if not argumento or "drive.google.com" not in argumento:
-            await self._enviar_dm(
-                dm_channel_id,
-                "⚠️ Uso correto: `!extrair https://drive.google.com/drive/folders/SUA_PASTA`"
-            )
-            return
-
-        await self._enviar_dm(dm_channel_id, "🔍 Varrendo pasta do Google Drive... Aguarde.")
-        links = await extrair_todos_links_gdrive(argumento)
-
-        if not links:
-            await self._enviar_dm(dm_channel_id, "❌ Nenhuma música encontrada ou a pasta não é pública.")
-            return
-
-        total = len(links)
-        await self._enviar_dm(
-            dm_channel_id,
-            f"✅ **{total} música(s) encontrada(s)!**\n"
-            f"Abaixo estão os comandos `!play` prontos divididos em blocos para você copiar e usar no servidor:"
-        )
-
-        # Envia em blocos de 20 links para não estourar o limite de caracteres do chat
-        tamanho_bloco = 20
-        for i in range(0, total, tamanho_bloco):
-            grupo = links[i:i + tamanho_bloco]
-            num_bloco = (i // tamanho_bloco) + 1
-            texto_bloco = f"**Bloco {num_bloco} (Músicas {i+1} até {min(i+tamanho_bloco, total)}):**\n"
-            texto_bloco += f"```\n!play {' '.join(grupo)}\n```"
-            await self._enviar_dm(dm_channel_id, texto_bloco)
 
     async def _concluir_configuracao(self, dm_channel_id: str, user_id: str, canal_texto_id: str, canal_voz_id: str) -> None:
         voice_session = VoiceSession(self.bot, canal_voz_id)
@@ -504,13 +491,11 @@ class GerenciadorSalas:
 
         await self._enviar_dm(
             dm_channel_id,
-            "🎉 Pronto!\n\nNo canal de texto configurado, utilize:\n"
-            "• `!play [Links/Pastas]` - Reproduz áudios\n"
-            "• `!skip` - Pula a faixa\n"
-            "• `!fila` - Exibe a fila atual\n"
-            "• `!stop` - Interrompe o som\n"
-            "• `!sair` - Desconecta o bot"
-            "• `!extair` - pega uma lista de link de cada música no Google drive"
+            "🎉 Bot conectado com sucesso!\n\nUse no servidor:\n"
+            "• `!play [link/pasta]` - Adiciona músicas\n"
+            "• `!skip` - Pula a música\n"
+            "• `!stop` - Para a música\n"
+            "• `!sair` - Desconecta"
         )
 
     async def processar_resposta_dm(self, dm_channel_id: str, texto: str) -> None:
@@ -556,7 +541,7 @@ gerenciador = GerenciadorSalas(bot)
 @bot.on("ready")
 async def on_ready(me):
     gerenciador.my_user_id = getattr(me, "id", None)
-    print(f"✅ Conectado com sucesso (Extrator de links ativado via DM!)")
+    print("✅ Bot de música pronto!")
 
 @bot.on("voice:user_joined")
 async def on_voice_user_joined(payload):
@@ -600,11 +585,6 @@ async def on_message(event):
         if comando == COMANDO_CONFIG:
             await gerenciador.iniciar_config(channel_id, autor_id)
             return
-        
-        # COMANDO NOVO NA DM
-        if comando in ["!extrair", "!links", "!pasta"]:
-            await gerenciador.processar_comando_extrair(channel_id, argumento)
-            return
 
         canal_texto_id, canal_voz_id = gerenciador._extrair_ids_do_modelo(conteudo)
         if canal_texto_id and canal_voz_id:
@@ -623,26 +603,27 @@ async def on_message(event):
     if sala:
         if comando in ["!play", "!tocar", "!playlist"]:
             if argumento:
-                links = await extrair_links_da_lista(argumento)
-                if not links:
-                    links = [argumento.strip()]
+                itens = await extrair_links_da_lista(argumento)
+                if not itens:
+                    itens = [{"url": argumento.strip()}]
 
-                cortado = len(links) > LIMITE_PLAYLIST
+                cortado = len(itens) > LIMITE_PLAYLIST
                 if cortado:
-                    links = links[:LIMITE_PLAYLIST]
+                    itens = itens[:LIMITE_PLAYLIST]
 
-                for link in links:
-                    sala.voice_session.adicionar_musica(link)
+                for item in itens:
+                    sala.voice_session.adicionar_musica(item)
                 
-                aviso_corte = f" (Máximo de {LIMITE_PLAYLIST} músicas atingido!)" if cortado else ""
+                aviso_corte = f" (Máximo de {LIMITE_PLAYLIST} por vez)" if cortado else ""
                 await bot.rest.create_message(
                     channel_id,
-                    f"🎶 {len(links)} música(s) adicionada(s) à fila!{aviso_corte}"
+                    f"🎶 {len(itens)} música(s) adicionada(s) à fila!{aviso_corte}\n"
+                    f"⚠️ *Caso não esteja escutando a música, saia e entre na ligação.*"
                 )
             else:
                 await bot.rest.create_message(
                     channel_id,
-                    "⚠️ Informe pelo menos um link ou **pasta do Google Drive**."
+                    "⚠️ Envie um link ou pasta junto com o comando."
                 )
 
         elif comando in ["!skip", "!pular"]:
@@ -651,18 +632,14 @@ async def on_message(event):
 
         elif comando in ["!stop", "!parar"]:
             sala.voice_session.parar()
-            await bot.rest.create_message(channel_id, "🛑 Reprodução interrompida e fila esvaziada.")
+            await bot.rest.create_message(channel_id, "🛑 Reprodução interrompida e fila limpa.")
 
         elif comando == "!sair" and not argumento:
             await gerenciador.sair_da_sala_por_texto(channel_id)
 
         elif comando in ["!fila", "!queue"]:
-            fila = sala.voice_session.fila
-            if not fila:
-                await bot.rest.create_message(channel_id, "A fila está vazia no momento.")
-            else:
-                lista = "\n".join(f"{i+1}. `{url[:50]}...`" if len(url) > 50 else f"{i+1}. `{url}`" for i, url in enumerate(fila[:10]))
-                await bot.rest.create_message(channel_id, f"📋 **Fila Atual (Top 10):**\n{lista}")
+            total = len(sala.voice_session.fila)
+            await bot.rest.create_message(channel_id, f"📋 **Músicas restantes na fila:** {total}")
 
 
 if __name__ == "__main__":
