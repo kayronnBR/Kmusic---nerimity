@@ -1,39 +1,20 @@
 """
-Bot de Música para Nerimity com Download Prévio de Áudio, Pacing de Precisão e WebRTC Sendonly.
-
-CORREÇÃO APLICADA: o áudio ficava "acelerado e cortando" porque havia DOIS
-temporizadores de tempo real disputando o ritmo da reprodução:
-  1) O `aiortc.contrib.media.MediaPlayer`, que já pausa internamente para
-     simular tempo real com base no `frame.time` do arquivo decodificado.
-  2) O `ContinuousAudioTrack`, que aplicava OUTRO pacing por cima, baseado
-     em `time.perf_counter()`.
-
-Quando esses dois relógios saíam de sincronia (o que é praticamente garantido,
-já que o tamanho de frame do MP3 raramente bate exatamente com os 960
-amostras/20ms esperados), o bloco de "resync" do ContinuousAudioTrack
-(`elif wait_time < -0.1: ...`) resetava o relógio de saída e liberava de uma
-vez todo o áudio acumulado no buffer, sem respeitar o tempo real — daí o
-efeito de "fast forward" e os cortes.
-
-A solução foi remover o `MediaPlayer` (que faz seu próprio pacing) e usar um
-decodificador dedicado (`AudioFileSource`) que apenas decodifica o arquivo
-o mais rápido possível para uma fila com backpressure (sem tentar simular
-tempo real). Assim, existe um ÚNICO responsável pelo ritmo da reprodução:
-o `ContinuousAudioTrack`.
+Bot de Música Ultra Leve para Nerimity.
+Focado em Streaming Direto, Rádios, Google Drive (Arquivos e Pastas) e Dropbox.
+Possui comando !extrair na DM para gerar arquivos .txt com listas de links.
 """
 
 import asyncio
 import fractions
-import os
+import gc
+import io
 import re
-import tempfile
-import threading
 import time
+import urllib.request
 from typing import Dict, Optional, List
 
 import av
 import numpy as np
-import yt_dlp
 
 from aiortc import (
     RTCConfiguration,
@@ -47,7 +28,7 @@ from aiortc.sdp import candidate_from_sdp
 from nerimity_sdk import Bot
 
 # --- CONFIGURAÇÕES ---
-TOKEN = "SEU_TOKEN_AQUI"
+TOKEN = "COLOQUE-TOKEN-AQUI"
 
 COMANDO_CONFIG = "!config"
 COMANDO_SAIR = "!sair"
@@ -56,32 +37,9 @@ SENHA_MESTRE = "SUA_SENHA_AQUI"
 
 USUARIOS_BLOQUEADOS = set()
 
-PEER_CONNECT_TIMEOUT = 20
+PEER_CONNECT_TIMEOUT = 15
+LIMITE_PLAYLIST = 50  # Limite máximo de músicas tocadas por vez na fila
 
-# Limite máximo de músicas que podem ser adicionadas de uma vez via !play/!playlist
-LIMITE_PLAYLIST = 50
-
-# Pasta temporária para armazenamento local do áudio
-TEMP_DIR = os.path.join(tempfile.gettempdir(), "kmusic_cache")
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-# Configurações do yt-dlp para download local prévio
-YTDL_OPTIONS = {
-    'format': 'bestaudio/best',
-    'outtmpl': os.path.join(TEMP_DIR, '%(id)s.%(ext)s'),
-    'noplaylist': True,
-    'nocheckcertificate': True,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '192',
-    }],
-}
-
-# Servidores STUN/TURN da plataforma
 ICE_SERVERS = [
     RTCIceServer(urls="stun:stun.l.google.com:19302"),
     RTCIceServer(urls="stun:stun.relay.metered.ca:80"),
@@ -90,42 +48,63 @@ ICE_SERVERS = [
         username="b9fafdffb3c428131bd9ae10",
         credential="DTk2mXfXv4kJYPvD",
     ),
-    RTCIceServer(
-        urls="turn:a.relay.metered.ca:443",
-        username="b9fafdffb3c428131bd9ae10",
-        credential="DTk2mXfXv4kJYPvD",
-    ),
 ]
 
 bot = Bot(token=TOKEN)
 
 
-def extrair_links_da_lista(texto: str) -> List[str]:
-    """
-    Extrai, em ordem, todos os links de uma mensagem de playlist personalizada
-    (um link por linha, ou vários separados por espaço/vírgula). Linhas que
-    não são links (títulos, comentários, numeração "1.", etc.) são ignoradas.
-    """
+def _obter_html_gdrive(folder_id: str) -> str:
+    """Faz a requisição HTTP leve para a pasta do Google Drive."""
+    url = f"https://drive.google.com/embeddedfolderview?id={folder_id}"
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        return response.read().decode('utf-8', errors='ignore')
+
+
+async def extrair_todos_links_gdrive(candidato: str) -> List[str]:
+    """Varre uma pasta do Google Drive e devolve TODOS os links sem limite."""
+    match_pasta = re.search(r'folders/([a-zA-Z0-9_-]+)', candidato)
+    if not match_pasta:
+        return []
+    folder_id = match_pasta.group(1)
+    try:
+        html = await asyncio.to_thread(_obter_html_gdrive, folder_id)
+        ids = re.findall(r'/file/d/([a-zA-Z0-9_-]+)', html)
+        ids_unicos = list(dict.fromkeys(ids))
+        return [f"https://drive.google.com/uc?export=download&id={fid}" for fid in ids_unicos]
+    except Exception as e:
+        print(f"Erro ao ler pasta do Drive: {e}")
+        return []
+
+
+async def extrair_links_da_lista(texto: str) -> List[str]:
+    """Extrai e converte links individuais e pastas (para uso no !play)."""
     candidatos = re.split(r'[\s,]+', texto.strip())
-    return [c for c in candidatos if c.startswith(('http://', 'https://'))]
+    links_prontos = []
+    
+    for c in candidatos:
+        if c.startswith(('http://', 'https://')):
+            if "drive.google.com" in c and "folders/" in c:
+                links_pasta = await extrair_todos_links_gdrive(c)
+                links_prontos.extend(links_pasta)
+            elif "drive.google.com/file/d/" in c:
+                match = re.search(r'/d/([a-zA-Z0-9_-]+)', c)
+                if match:
+                    links_prontos.append(f"https://drive.google.com/uc?export=download&id={match.group(1)}")
+            elif "dropbox.com" in c:
+                c = c.replace("?dl=0", "?dl=1")
+                if "&dl=1" not in c and "?dl=1" not in c:
+                    c += "&dl=1" if "?" in c else "?dl=1"
+                links_prontos.append(c)
+            else:
+                links_prontos.append(c)
+            
+    return links_prontos
 
 
 class AudioFileSource:
-    """
-    Decodifica um arquivo (ou stream) de áudio em uma thread separada,
-    SEM tentar simular tempo real, e entrega os frames já resampleados
-    (s16, mono, 48kHz) através de uma fila assíncrona.
-
-    A fila tem tamanho máximo (`buffer_frames`), o que cria backpressure:
-    a thread de decodificação só produz mais rápido que o consumo até
-    encher o buffer, depois disso ela espera. Isso evita tanto o consumo
-    de memória descontrolado quanto qualquer tentativa paralela de
-    "temporizar" o áudio — quem dita o ritmo é exclusivamente quem
-    consome (`ContinuousAudioTrack`).
-    """
-
-    def __init__(self, path: str, loop: asyncio.AbstractEventLoop, buffer_frames: int = 200):
-        self.path = path
+    def __init__(self, url: str, loop: asyncio.AbstractEventLoop, buffer_frames: int = 50):
+        self.url = url
         self.loop = loop
         self.queue: "asyncio.Queue" = asyncio.Queue(maxsize=buffer_frames)
         self._resampler = av.AudioResampler(format="s16", layout="mono", rate=48000)
@@ -139,7 +118,7 @@ class AudioFileSource:
     def _run(self) -> None:
         container = None
         try:
-            container = av.open(self.path)
+            container = av.open(self.url, options={'timeout': '5000000'})
             stream = next((s for s in container.streams if s.type == "audio"), None)
             if stream is None:
                 return
@@ -156,12 +135,12 @@ class AudioFileSource:
                     if self._stopped:
                         break
                     fut = asyncio.run_coroutine_threadsafe(self.queue.put(r_frame), self.loop)
-                    fut.result()  # bloqueia a thread de decodificação (backpressure)
+                    fut.result()
 
                 if self._stopped:
                     break
         except Exception as e:
-            print(f"Erro ao decodificar áudio ({self.path}): {e}")
+            print(f"Erro ao decodificar link: {e}")
         finally:
             if container is not None:
                 try:
@@ -184,32 +163,13 @@ class AudioFileSource:
 
 
 class ContinuousAudioTrack(MediaStreamTrack):
-    """
-    Faixa de áudio "burra": não decodifica nem paceia nada por conta
-    própria. Ela só repassa ao WebRTC os frames que o "pump" central da
-    VoiceSession (`_audio_pump_loop`) distribui para todos os ouvintes
-    ao mesmo tempo.
-
-    IMPORTANTE: antes, cada ouvinte tinha seu próprio relógio e todos
-    chamavam `.recv()` diretamente na mesma fonte de áudio compartilhada
-    — ou seja, com 2+ ouvintes no canal, cada um "roubava" frames do
-    outro, recebendo só uma fração do áudio real enquanto o contador de
-    tempo (pts) de cada um continuava avançando normalmente. O resultado
-    era música tocando mais rápido que o normal e cortada. Agora existe
-    um único pacer para a sessão inteira, e cada ouvinte só recebe uma
-    cópia dos mesmos frames, na mesma cadência.
-    """
     kind = "audio"
 
     def __init__(self):
         super().__init__()
-        # Fila pequena: se este ouvinte específico atrasar para consumir
-        # (rede lenta, etc.), preferimos descartar o frame mais antigo a
-        # deixar a fila crescer e a reprodução dele atrasar cada vez mais.
-        self._queue: "asyncio.Queue" = asyncio.Queue(maxsize=3)
+        self._queue: "asyncio.Queue" = asyncio.Queue(maxsize=2)
 
     def push_frame(self, frame) -> None:
-        """Chamado pelo pump central para entregar o próximo frame de 20ms."""
         try:
             self._queue.put_nowait(frame)
         except asyncio.QueueFull:
@@ -227,8 +187,6 @@ class ContinuousAudioTrack(MediaStreamTrack):
 
 
 class VoiceSession:
-    """Gerencia conexões WebRTC em modo exclusivo de transmissão (Sendonly)."""
-
     def __init__(self, bot: Bot, channel_id: str):
         self.bot = bot
         self.channel_id = channel_id
@@ -239,36 +197,10 @@ class VoiceSession:
 
         self.fila: List[str] = []
         self.current_track: Optional[AudioFileSource] = None
-        self.current_file_path: Optional[str] = None
-        # ID do canal de TEXTO configurado, para poder avisar sobre o que
-        # está tocando/fila. Setado pela GerenciadorSalas logo após a
-        # criação da sessão.
         self.canal_texto_id: Optional[str] = None
-        # Evita repetir o aviso de "fila acabou" a cada segundo enquanto
-        # o bot fica ocioso esperando novas músicas, e evita mandar esse
-        # aviso logo ao entrar no canal, antes de tocar qualquer coisa.
         self._avisou_fila_vazia = False
         self._ja_tocou_alguma_musica = False
-        # Sinaliza (para a thread de download do yt-dlp) que o download
-        # em andamento deve ser cancelado — setado por !stop/!sair.
-        self._cancelar_evento = threading.Event()
-
-        # --- Pipeline de pré-download ---
-        # `fila` guarda só os links ainda NÃO iniciados. O `_prepare_loop`
-        # roda em paralelo ao `_play_loop` e vai baixando, com antecedência,
-        # a(s) próxima(s) música(s) (uma de cada vez, `maxsize=1`), deixando
-        # o resultado pronto em `_prontos`. Assim, quando a música atual
-        # termina, a próxima já está baixada e toca sem espera.
-        self._prontos: "asyncio.Queue" = asyncio.Queue(maxsize=1)
-        # Contador incrementado a cada `!stop`, usado para descartar
-        # downloads que estavam em andamento antes do stop (e que só
-        # terminariam DEPOIS dele) — evita tocar uma música "fantasma".
-        self._geracao = 0
-
         self._play_task = asyncio.create_task(self._play_loop())
-        self._prepare_task = asyncio.create_task(self._prepare_loop())
-        # Único responsável por decidir QUANDO cada frame de 20ms sai —
-        # compartilhado por todos os ouvintes desta sessão de voz.
         self._pump_task = asyncio.create_task(self._audio_pump_loop())
 
     async def join(self) -> None:
@@ -283,7 +215,6 @@ class VoiceSession:
     async def leave(self) -> None:
         self.parar()
         self._play_task.cancel()
-        self._prepare_task.cancel()
         self._pump_task.cancel()
         for pc in list(self.peers.values()):
             await pc.close()
@@ -297,275 +228,56 @@ class VoiceSession:
         self.fila.append(url)
 
     def finalizar_musica_atual(self):
-        # NÃO cancela downloads em andamento aqui: quem está sendo baixado
-        # nesse momento é a PRÓXIMA música (pipeline de pré-download), não
-        # a atual — ela já foi baixada antes de começar a tocar. Cancelar
-        # esse download interromperia a preparação da próxima faixa.
         if self.current_track:
             try:
                 self.current_track.stop()
             except Exception:
                 pass
         self.current_track = None
-
-        # Exclui o arquivo temporário baixado após o término da música
-        if self.current_file_path and os.path.exists(self.current_file_path):
-            try:
-                os.remove(self.current_file_path)
-            except Exception:
-                pass
-            self.current_file_path = None
+        gc.collect()
 
     def pular_musica(self):
-        # Só encerra a música atual. A próxima (se já estiver pronta em
-        # `_prontos`, graças ao pré-download) assume imediatamente no
-        # `_play_loop`, sem esperar novo download.
         self.finalizar_musica_atual()
-
-    def _esvaziar_prontos(self) -> None:
-        """Descarta tudo que já foi pré-baixado e apaga os arquivos temporários."""
-        while True:
-            try:
-                item = self._prontos.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            caminho = item.get("caminho")
-            if item.get("temporario") and caminho and os.path.exists(caminho):
-                try:
-                    os.remove(caminho)
-                except Exception:
-                    pass
 
     def parar(self):
         self.fila.clear()
-        # Invalida qualquer download em andamento no `_prepare_loop`: ao
-        # terminar, ele vai perceber que a "geração" mudou e descartar o
-        # resultado em vez de colocá-lo em `_prontos`.
-        self._geracao += 1
-        # Cancela o download que estiver rolando agora (o hook de
-        # progresso do yt-dlp checa esta flag e aborta o download).
-        self._cancelar_evento.set()
-        self._esvaziar_prontos()
         self.finalizar_musica_atual()
 
-    def _limpar_arquivo_parcial(self, caminho: Optional[str]) -> None:
-        """Remove arquivos parciais deixados por um download cancelado no meio."""
-        if not caminho:
-            return
-        for candidato in (caminho, caminho + ".part", caminho + ".ytdl"):
-            try:
-                if os.path.exists(candidato):
-                    os.remove(candidato)
-            except Exception:
-                pass
-
     async def _enviar_texto(self, texto: str) -> None:
-        """Envia um aviso no canal de texto configurado (se houver)."""
         if not self.canal_texto_id:
             return
         try:
             await self.bot.rest.create_message(self.canal_texto_id, texto)
-        except Exception as e:
-            print(f"Aviso: não foi possível enviar mensagem no canal de texto: {e}")
-
-    async def _baixar_audio_local(self, url: str):
-        """Baixa o arquivo de áudio completo antes de iniciar a reprodução."""
-        loop = asyncio.get_event_loop()
-        self._cancelar_evento.clear()
-        arquivo_parcial = {"caminho": None}
-
-        def _hook(d):
-            if d.get("filename"):
-                arquivo_parcial["caminho"] = d.get("filename")
-            if self._cancelar_evento.is_set():
-                # Qualquer exceção levantada dentro do hook interrompe o
-                # download do yt-dlp imediatamente.
-                raise Exception("__cancelado_pelo_usuario__")
-
-        def _download():
-            opcoes = dict(YTDL_OPTIONS)
-            opcoes['progress_hooks'] = [_hook]
-            with yt_dlp.YoutubeDL(opcoes) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if 'entries' in info:
-                    info = info['entries'][0]
-
-                filename = ydl.prepare_filename(info)
-                base, _ = os.path.splitext(filename)
-                mp3_filename = base + ".mp3"
-
-                caminho_final = mp3_filename if os.path.exists(mp3_filename) else filename
-                return caminho_final, info.get('title', 'Música Desconhecida')
-
-        try:
-            return await loop.run_in_executor(None, _download)
-        except Exception as e:
-            if self._cancelar_evento.is_set():
-                print(f"⏹️ Download cancelado pelo usuário ({url}).")
-            else:
-                print(f"Erro ao baixar áudio ({url}): {e}")
-            self._limpar_arquivo_parcial(arquivo_parcial["caminho"])
-            return None, None
-
-    async def _extrair_info(self, url: str):
-        """
-        Consulta o yt-dlp SEM baixar nada, só para descobrir os metadados
-        do link (título, duração, se é transmissão ao vivo, e a URL direta
-        do stream de áudio).
-        """
-        loop = asyncio.get_event_loop()
-
-        def _extrair():
-            opcoes = dict(YTDL_OPTIONS)
-            opcoes['skip_download'] = True
-            opcoes.pop('postprocessors', None)
-            with yt_dlp.YoutubeDL(opcoes) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if 'entries' in info:
-                    info = info['entries'][0]
-                return info
-
-        try:
-            return await loop.run_in_executor(None, _extrair)
-        except Exception as e:
-            print(f"Erro ao extrair informações ({url}): {e}")
-            return None
-
-    # Extensões de arquivo de áudio direto: tocamos via streaming (sem
-    # baixar primeiro) para começar a tocar mais rápido — o av.open lê
-    # direto da URL remota, igual faz com os links de rádio.
-    EXTENSOES_ARQUIVO_FINITO = ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.opus', '.wma')
-
-    async def _preparar_musica(self, link_usuario: str) -> Optional[dict]:
-        """
-        Resolve um link (extrai metadados e, se necessário, baixa o
-        áudio localmente) e devolve um dicionário pronto para tocar, ou
-        `None` se falhar. Não mexe em `self.current_track` — só prepara.
-        """
-        url_sem_query = link_usuario.split('?')[0].lower()
-        titulo_stream = None
-
-        if url_sem_query.endswith(self.EXTENSOES_ARQUIVO_FINITO):
-            # Link direto para um arquivo de áudio: streama sem baixar.
-            info = None
-            eh_ao_vivo = True
-            titulo_stream = os.path.basename(url_sem_query) or "Arquivo de Áudio"
-        else:
-            info = await self._extrair_info(link_usuario)
-
-            if info is not None:
-                # Se o yt-dlp não retorna duração, ou marca como
-                # live_status, é uma transmissão contínua/infinita
-                # (rádio) — não pode (nem faz sentido) ser baixada.
-                eh_ao_vivo = (
-                    bool(info.get('is_live'))
-                    or info.get('live_status') in ('is_live', 'is_upcoming', 'post_live')
-                    or not info.get('duration')
-                )
-            else:
-                # yt-dlp não conseguiu extrair metadados: provavelmente
-                # é uma URL de stream de áudio puro sem suporte
-                # específico. Cai na heurística por extensão como
-                # último recurso.
-                eh_ao_vivo = (
-                    link_usuario.endswith(('.m3u', '.m3u8', '.pls', '.aac'))
-                    or ":80" in link_usuario
-                )
-
-        if eh_ao_vivo:
-            caminho_ou_url = (info.get('url') if info else None) or link_usuario
-            titulo = (info.get('title') if info else None) or titulo_stream or "Rádio Ao Vivo"
-            eh_temporario = False
-        else:
-            caminho_ou_url, titulo = await self._baixar_audio_local(link_usuario)
-            eh_temporario = True
-
-        if not caminho_ou_url:
-            return None
-
-        return {"caminho": caminho_ou_url, "titulo": titulo, "temporario": eh_temporario}
-
-    async def _prepare_loop(self):
-        """
-        Roda em paralelo ao `_play_loop`, baixando com antecedência a
-        próxima música da fila (uma de cada vez — `_prontos` tem
-        `maxsize=1`). Enquanto a música 1 está tocando, este loop já
-        baixa a música 2 e a deixa pronta; assim que a 1 termina, a 2
-        toca na hora, sem espera de download.
-        """
-        while True:
-            if not self.fila or self._prontos.full():
-                await asyncio.sleep(0.5)
-                continue
-
-            link_usuario = self.fila.pop(0)
-            geracao_no_inicio = self._geracao
-
-            item = await self._preparar_musica(link_usuario)
-
-            if item is None:
-                continue
-
-            if self._geracao != geracao_no_inicio:
-                # Houve um `!stop` enquanto isso baixava: descarta.
-                caminho = item.get("caminho")
-                if item.get("temporario") and caminho and os.path.exists(caminho):
-                    try:
-                        os.remove(caminho)
-                    except Exception:
-                        pass
-                continue
-
-            await self._prontos.put(item)
+        except Exception:
+            pass
 
     async def _play_loop(self):
-        """
-        Loop principal de reprodução: só consome itens já preparados
-        (baixados) por `_prepare_loop` — não baixa nada diretamente.
-        """
         while True:
-            if self.current_track is not None:
-                await asyncio.sleep(0.5)
-                continue
-
-            if self._prontos.empty():
+            if not self.fila or self.current_track is not None:
                 if (
                     not self.fila
+                    and self.current_track is None
                     and self._ja_tocou_alguma_musica
                     and not self._avisou_fila_vazia
                 ):
                     self._avisou_fila_vazia = True
-                    await self._enviar_texto("🏁 A fila acabou! Manda mais música com `!play`.")
-                await asyncio.sleep(0.3)
+                    await self._enviar_texto("🏁 A fila acabou! Mande mais links ou pastas de áudio.")
+                await asyncio.sleep(1)
                 continue
 
             self._avisou_fila_vazia = False
-            item = await self._prontos.get()
-            caminho_ou_url = item["caminho"]
-            titulo = item["titulo"]
-            eh_temporario = item["temporario"]
+            link_usuario = self.fila.pop(0)
 
             try:
                 loop = asyncio.get_running_loop()
-                self.current_track = AudioFileSource(caminho_ou_url, loop)
-                if eh_temporario:
-                    self.current_file_path = caminho_ou_url
+                self.current_track = AudioFileSource(link_usuario, loop)
                 self._ja_tocou_alguma_musica = True
-                print(f"▶️ Tocando: {titulo}")
-                await self._enviar_texto(f"▶️ Tocando agora: **{titulo}**")
+                await self._enviar_texto(f"▶️ Tentando sintonizar:\n`{link_usuario[:80]}...`")
             except Exception as e:
-                print(f"Erro ao carregar o arquivo de áudio: {e}")
+                print(f"Erro ao carregar áudio: {e}")
                 self.finalizar_musica_atual()
 
     async def _audio_pump_loop(self):
-        """
-        Único temporizador de tempo real da sessão. Lê da fonte de áudio
-        atual (`self.current_track`), monta frames de exatamente 960
-        amostras (20ms a 48kHz) no ritmo correto via `perf_counter`, e
-        distribui (broadcast) cada frame para TODOS os ouvintes conectados
-        no momento. Isso garante que todo mundo escute exatamente a mesma
-        coisa, no mesmo instante, sem disputar a mesma fonte.
-        """
         FRAME_SIZE = 960
         fifo = av.AudioFifo()
         pts = 0
@@ -579,8 +291,6 @@ class VoiceSession:
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
             elif wait_time < -0.1:
-                # Atraso real e grande (hiccup de CPU/IO) — ressincroniza
-                # sem tentar "correr atrás", evitando bursts.
                 start_time = time.perf_counter() - (pts / 48000.0)
 
             while fifo.samples < FRAME_SIZE:
@@ -598,8 +308,6 @@ class VoiceSession:
                         pass
                 else:
                     if self.current_track is not None:
-                        # Fim do arquivo/stream: avança para a próxima
-                        # música da fila.
                         self.finalizar_musica_atual()
                     silence_data = np.zeros((1, FRAME_SIZE), dtype=np.int16)
                     silence_frame = av.AudioFrame.from_ndarray(silence_data, format="s16", layout="mono")
@@ -617,7 +325,6 @@ class VoiceSession:
             out_frame.time_base = fractions.Fraction(1, 48000)
             pts += FRAME_SIZE
 
-            # Distribui o MESMO frame para todos os ouvintes conectados.
             for track in list(self.tracks.values()):
                 track.push_frame(out_frame)
 
@@ -712,6 +419,7 @@ class FluxoConfig:
         self.user_id = user_id
         self.estado = ConfigState.AGUARDANDO_MODELO
 
+
 class GerenciadorSalas:
     def __init__(self, bot: Bot):
         self.bot = bot
@@ -731,7 +439,6 @@ class GerenciadorSalas:
         return self.salas_por_voz.get(canal_voz_id)
 
     def _extrair_ids_do_modelo(self, texto: str):
-        """Extrai 'ID TEXTO: ...' e 'ID VOZ: ...' de um texto preenchido pelo usuário."""
         match_texto = re.search(r'ID\s*TEXTO\s*:\s*(\S+)', texto, re.IGNORECASE)
         match_voz = re.search(r'ID\s*VOZ\s*:\s*(\S+)', texto, re.IGNORECASE)
         canal_texto_id = match_texto.group(1).strip() if match_texto else None
@@ -742,14 +449,45 @@ class GerenciadorSalas:
         self.fluxos[dm_channel_id] = FluxoConfig(dm_channel_id, user_id)
         await self._enviar_dm(
             dm_channel_id,
-            "👋 Olá! Sou o Bot de Música do Nerimity.\n\n"
+            "👋 Olá! Sou o Bot de Música (Modo Leve).\n\n"
             "Preencha o modelo abaixo com os IDs e me envie de volta:\n\n"
-            "```\nID TEXTO: \nID VOZ: \n```"
+            "```\nID TEXTO: \nID VOZ: \n```\n"
+            "💡 *Dica:* Para organizar uma pasta grande do Drive, envie `!extrair <link_da_pasta>`."
         )
 
-    async def _concluir_configuracao(
-        self, dm_channel_id: str, user_id: str, canal_texto_id: str, canal_voz_id: str
-    ) -> None:
+    async def processar_comando_extrair(self, dm_channel_id: str, argumento: str) -> None:
+        """Processa a extração de pastas grandes e envia a lista formatada no chat."""
+        if not argumento or "drive.google.com" not in argumento:
+            await self._enviar_dm(
+                dm_channel_id,
+                "⚠️ Uso correto: `!extrair https://drive.google.com/drive/folders/SUA_PASTA`"
+            )
+            return
+
+        await self._enviar_dm(dm_channel_id, "🔍 Varrendo pasta do Google Drive... Aguarde.")
+        links = await extrair_todos_links_gdrive(argumento)
+
+        if not links:
+            await self._enviar_dm(dm_channel_id, "❌ Nenhuma música encontrada ou a pasta não é pública.")
+            return
+
+        total = len(links)
+        await self._enviar_dm(
+            dm_channel_id,
+            f"✅ **{total} música(s) encontrada(s)!**\n"
+            f"Abaixo estão os comandos `!play` prontos divididos em blocos para você copiar e usar no servidor:"
+        )
+
+        # Envia em blocos de 20 links para não estourar o limite de caracteres do chat
+        tamanho_bloco = 20
+        for i in range(0, total, tamanho_bloco):
+            grupo = links[i:i + tamanho_bloco]
+            num_bloco = (i // tamanho_bloco) + 1
+            texto_bloco = f"**Bloco {num_bloco} (Músicas {i+1} até {min(i+tamanho_bloco, total)}):**\n"
+            texto_bloco += f"```\n!play {' '.join(grupo)}\n```"
+            await self._enviar_dm(dm_channel_id, texto_bloco)
+
+    async def _concluir_configuracao(self, dm_channel_id: str, user_id: str, canal_texto_id: str, canal_voz_id: str) -> None:
         voice_session = VoiceSession(self.bot, canal_voz_id)
         voice_session.my_user_id = self.my_user_id
         voice_session.canal_texto_id = canal_texto_id
@@ -767,12 +505,12 @@ class GerenciadorSalas:
         await self._enviar_dm(
             dm_channel_id,
             "🎉 Pronto!\n\nNo canal de texto configurado, utilize:\n"
-            "• `!play [URL/Link]` - Toca músicas, lives ou rádios\n"
-            "• `!play` com vários links (um por linha) ou `!playlist` - Toca uma playlist personalizada, em ordem\n"
-            "• `!skip` - Pula a música atual\n"
-            "• `!fila` - Exibe as próximas músicas\n"
-            "• `!stop` - Limpa a fila e desliga a música\n"
-            "• `!sair` - Tira o bot do canal de voz"
+            "• `!play [Links/Pastas]` - Reproduz áudios\n"
+            "• `!skip` - Pula a faixa\n"
+            "• `!fila` - Exibe a fila atual\n"
+            "• `!stop` - Interrompe o som\n"
+            "• `!sair` - Desconecta o bot"
+            "• `!extair` - pega uma lista de link de cada música no Google drive"
         )
 
     async def processar_resposta_dm(self, dm_channel_id: str, texto: str) -> None:
@@ -785,11 +523,7 @@ class GerenciadorSalas:
         if fluxo.estado == ConfigState.AGUARDANDO_MODELO:
             canal_texto_id, canal_voz_id = self._extrair_ids_do_modelo(texto_original)
             if not canal_texto_id or not canal_voz_id:
-                await self._enviar_dm(
-                    dm_channel_id,
-                    "⚠️ Não consegui encontrar os dois IDs preenchidos. Envie novamente no formato:\n\n"
-                    "```\nID TEXTO: 123456\nID VOZ: 654321\n```"
-                )
+                await self._enviar_dm(dm_channel_id, "⚠️ IDs inválidos. Envie no formato:\n```\nID TEXTO: 123\nID VOZ: 456\n```")
                 return
             await self._concluir_configuracao(dm_channel_id, fluxo.user_id, canal_texto_id, canal_voz_id)
 
@@ -798,15 +532,14 @@ class GerenciadorSalas:
         if not sala: return
         self.salas_por_texto.pop(sala.canal_texto_id, None)
         await sala.voice_session.leave()
-        await self._enviar_dm(dm_channel_id, f"🔇 O bot saiu do canal de voz `{canal_voz_id}`.")
+        await self._enviar_dm(dm_channel_id, f"🔇 Saiu do canal `{canal_voz_id}`.")
 
     async def sair_da_sala_por_texto(self, canal_texto_id: str) -> None:
-        """Usado quando o comando de sair vem do próprio canal de texto configurado."""
         sala = self.salas_por_texto.pop(canal_texto_id, None)
         if not sala: return
         self.salas_por_voz.pop(sala.canal_voz_id, None)
         await sala.voice_session.leave()
-        await self.bot.rest.create_message(canal_texto_id, "🔇 Saindo do canal de voz. Até mais!")
+        await self.bot.rest.create_message(canal_texto_id, "🔇 Saindo do canal de voz.")
 
     async def resetar_tudo(self, dm_channel_id: str) -> None:
         for sala in list(self.salas_por_voz.values()):
@@ -814,7 +547,7 @@ class GerenciadorSalas:
         self.salas_por_texto.clear()
         self.salas_por_voz.clear()
         self.fluxos.pop(dm_channel_id, None)
-        await self._enviar_dm(dm_channel_id, "🔄 Bot desconectado de todas as chamadas.")
+        await self._enviar_dm(dm_channel_id, "🔄 Bot desconectado de tudo.")
 
 
 gerenciador = GerenciadorSalas(bot)
@@ -823,7 +556,7 @@ gerenciador = GerenciadorSalas(bot)
 @bot.on("ready")
 async def on_ready(me):
     gerenciador.my_user_id = getattr(me, "id", None)
-    print(f"✅ Conectado com sucesso como {getattr(me, 'username', '?')}")
+    print(f"✅ Conectado com sucesso (Extrator de links ativado via DM!)")
 
 @bot.on("voice:user_joined")
 async def on_voice_user_joined(payload):
@@ -860,20 +593,19 @@ async def on_message(event):
         if comando == COMANDO_MESTRE and argumento == SENHA_MESTRE:
             await gerenciador.resetar_tudo(channel_id)
             return
-
         if str(autor_id) in USUARIOS_BLOQUEADOS: return
-
         if comando == COMANDO_SAIR:
             await gerenciador.sair_da_sala(channel_id, argumento)
             return
-
         if comando == COMANDO_CONFIG:
             await gerenciador.iniciar_config(channel_id, autor_id)
             return
+        
+        # COMANDO NOVO NA DM
+        if comando in ["!extrair", "!links", "!pasta"]:
+            await gerenciador.processar_comando_extrair(channel_id, argumento)
+            return
 
-        # Se a mensagem já vem com os dois IDs preenchidos (o modelo
-        # "ID TEXTO: ... / ID VOZ: ..."), configura direto, mesmo que a
-        # pessoa não tenha pedido !config antes nem esteja num fluxo ativo.
         canal_texto_id, canal_voz_id = gerenciador._extrair_ids_do_modelo(conteudo)
         if canal_texto_id and canal_voz_id:
             gerenciador.fluxos.pop(channel_id, None)
@@ -883,22 +615,16 @@ async def on_message(event):
         if channel_id in gerenciador.fluxos:
             await gerenciador.processar_resposta_dm(channel_id, conteudo)
             return
-
-        # Qualquer outra mensagem em DM já inicia a configuração
-        # automaticamente — não precisa mais digitar !config.
         await gerenciador.iniciar_config(channel_id, autor_id)
         return
 
     # -- SERVIDOR --
     sala = gerenciador.sala_por_canal_texto(channel_id)
     if sala:
-        if comando in ["!play", "!tocar", "!playlist", "!lista"]:
+        if comando in ["!play", "!tocar", "!playlist"]:
             if argumento:
-                links = extrair_links_da_lista(argumento)
+                links = await extrair_links_da_lista(argumento)
                 if not links:
-                    # Não veio nenhum link reconhecível (ex: começa sem
-                    # "http") — trata a mensagem inteira como um único
-                    # pedido (ex: busca por nome de música).
                     links = [argumento.strip()]
 
                 cortado = len(links) > LIMITE_PLAYLIST
@@ -907,24 +633,16 @@ async def on_message(event):
 
                 for link in links:
                     sala.voice_session.adicionar_musica(link)
-
-                if len(links) > 1:
-                    aviso_corte = f" (limite de {LIMITE_PLAYLIST} por vez, o restante foi ignorado)" if cortado else ""
-                    await bot.rest.create_message(
-                        channel_id,
-                        f"🎶 {len(links)} músicas adicionadas à fila, na ordem enviada!{aviso_corte} "
-                        "Vai começar a tocar em instantes, aguarde um pouco 🙂"
-                    )
-                else:
-                    await bot.rest.create_message(
-                        channel_id,
-                        "🎶 Adicionado à fila! Vai começar a tocar em instantes, aguarde um pouco 🙂"
-                    )
+                
+                aviso_corte = f" (Máximo de {LIMITE_PLAYLIST} músicas atingido!)" if cortado else ""
+                await bot.rest.create_message(
+                    channel_id,
+                    f"🎶 {len(links)} música(s) adicionada(s) à fila!{aviso_corte}"
+                )
             else:
                 await bot.rest.create_message(
                     channel_id,
-                    "⚠️ Informe um link válido (YouTube, SoundCloud, Rádio ou Arquivo de Áudio).\n"
-                    "Dica: para tocar uma playlist personalizada, mande vários links, um por linha, depois de `!play`."
+                    "⚠️ Informe pelo menos um link ou **pasta do Google Drive**."
                 )
 
         elif comando in ["!skip", "!pular"]:
@@ -943,8 +661,8 @@ async def on_message(event):
             if not fila:
                 await bot.rest.create_message(channel_id, "A fila está vazia no momento.")
             else:
-                lista = "\n".join(f"{i+1}. {url}" for i, url in enumerate(fila[:10]))
-                await bot.rest.create_message(channel_id, f"📋 **Fila Atual:**\n{lista}")
+                lista = "\n".join(f"{i+1}. `{url[:50]}...`" if len(url) > 50 else f"{i+1}. `{url}`" for i, url in enumerate(fila[:10]))
+                await bot.rest.create_message(channel_id, f"📋 **Fila Atual (Top 10):**\n{lista}")
 
 
 if __name__ == "__main__":
