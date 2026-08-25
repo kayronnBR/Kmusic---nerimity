@@ -250,9 +250,23 @@ class VoiceSession:
         self._avisou_fila_vazia = False
         self._ja_tocou_alguma_musica = False
         # Sinaliza (para a thread de download do yt-dlp) que o download
-        # em andamento deve ser cancelado — setado por !skip/!stop/!sair.
+        # em andamento deve ser cancelado — setado por !stop/!sair.
         self._cancelar_evento = threading.Event()
+
+        # --- Pipeline de pré-download ---
+        # `fila` guarda só os links ainda NÃO iniciados. O `_prepare_loop`
+        # roda em paralelo ao `_play_loop` e vai baixando, com antecedência,
+        # a(s) próxima(s) música(s) (uma de cada vez, `maxsize=1`), deixando
+        # o resultado pronto em `_prontos`. Assim, quando a música atual
+        # termina, a próxima já está baixada e toca sem espera.
+        self._prontos: "asyncio.Queue" = asyncio.Queue(maxsize=1)
+        # Contador incrementado a cada `!stop`, usado para descartar
+        # downloads que estavam em andamento antes do stop (e que só
+        # terminariam DEPOIS dele) — evita tocar uma música "fantasma".
+        self._geracao = 0
+
         self._play_task = asyncio.create_task(self._play_loop())
+        self._prepare_task = asyncio.create_task(self._prepare_loop())
         # Único responsável por decidir QUANDO cada frame de 20ms sai —
         # compartilhado por todos os ouvintes desta sessão de voz.
         self._pump_task = asyncio.create_task(self._audio_pump_loop())
@@ -269,6 +283,7 @@ class VoiceSession:
     async def leave(self) -> None:
         self.parar()
         self._play_task.cancel()
+        self._prepare_task.cancel()
         self._pump_task.cancel()
         for pc in list(self.peers.values()):
             await pc.close()
@@ -282,10 +297,10 @@ class VoiceSession:
         self.fila.append(url)
 
     def finalizar_musica_atual(self):
-        # Cancela um download em andamento (se houver) — o hook de
-        # progresso do yt-dlp checa esta flag e aborta o download.
-        self._cancelar_evento.set()
-
+        # NÃO cancela downloads em andamento aqui: quem está sendo baixado
+        # nesse momento é a PRÓXIMA música (pipeline de pré-download), não
+        # a atual — ela já foi baixada antes de começar a tocar. Cancelar
+        # esse download interromperia a preparação da próxima faixa.
         if self.current_track:
             try:
                 self.current_track.stop()
@@ -302,10 +317,35 @@ class VoiceSession:
             self.current_file_path = None
 
     def pular_musica(self):
+        # Só encerra a música atual. A próxima (se já estiver pronta em
+        # `_prontos`, graças ao pré-download) assume imediatamente no
+        # `_play_loop`, sem esperar novo download.
         self.finalizar_musica_atual()
+
+    def _esvaziar_prontos(self) -> None:
+        """Descarta tudo que já foi pré-baixado e apaga os arquivos temporários."""
+        while True:
+            try:
+                item = self._prontos.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            caminho = item.get("caminho")
+            if item.get("temporario") and caminho and os.path.exists(caminho):
+                try:
+                    os.remove(caminho)
+                except Exception:
+                    pass
 
     def parar(self):
         self.fila.clear()
+        # Invalida qualquer download em andamento no `_prepare_loop`: ao
+        # terminar, ele vai perceber que a "geração" mudou e descartar o
+        # resultado em vez de colocá-lo em `_prontos`.
+        self._geracao += 1
+        # Cancela o download que estiver rolando agora (o hook de
+        # progresso do yt-dlp checa esta flag e aborta o download).
+        self._cancelar_evento.set()
+        self._esvaziar_prontos()
         self.finalizar_musica_atual()
 
     def _limpar_arquivo_parcial(self, caminho: Optional[str]) -> None:
@@ -396,63 +436,114 @@ class VoiceSession:
     # direto da URL remota, igual faz com os links de rádio.
     EXTENSOES_ARQUIVO_FINITO = ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.opus', '.wma')
 
-    async def _play_loop(self):
-        """Loop principal de reprodução da fila."""
+    async def _preparar_musica(self, link_usuario: str) -> Optional[dict]:
+        """
+        Resolve um link (extrai metadados e, se necessário, baixa o
+        áudio localmente) e devolve um dicionário pronto para tocar, ou
+        `None` se falhar. Não mexe em `self.current_track` — só prepara.
+        """
+        url_sem_query = link_usuario.split('?')[0].lower()
+        titulo_stream = None
+
+        if url_sem_query.endswith(self.EXTENSOES_ARQUIVO_FINITO):
+            # Link direto para um arquivo de áudio: streama sem baixar.
+            info = None
+            eh_ao_vivo = True
+            titulo_stream = os.path.basename(url_sem_query) or "Arquivo de Áudio"
+        else:
+            info = await self._extrair_info(link_usuario)
+
+            if info is not None:
+                # Se o yt-dlp não retorna duração, ou marca como
+                # live_status, é uma transmissão contínua/infinita
+                # (rádio) — não pode (nem faz sentido) ser baixada.
+                eh_ao_vivo = (
+                    bool(info.get('is_live'))
+                    or info.get('live_status') in ('is_live', 'is_upcoming', 'post_live')
+                    or not info.get('duration')
+                )
+            else:
+                # yt-dlp não conseguiu extrair metadados: provavelmente
+                # é uma URL de stream de áudio puro sem suporte
+                # específico. Cai na heurística por extensão como
+                # último recurso.
+                eh_ao_vivo = (
+                    link_usuario.endswith(('.m3u', '.m3u8', '.pls', '.aac'))
+                    or ":80" in link_usuario
+                )
+
+        if eh_ao_vivo:
+            caminho_ou_url = (info.get('url') if info else None) or link_usuario
+            titulo = (info.get('title') if info else None) or titulo_stream or "Rádio Ao Vivo"
+            eh_temporario = False
+        else:
+            caminho_ou_url, titulo = await self._baixar_audio_local(link_usuario)
+            eh_temporario = True
+
+        if not caminho_ou_url:
+            return None
+
+        return {"caminho": caminho_ou_url, "titulo": titulo, "temporario": eh_temporario}
+
+    async def _prepare_loop(self):
+        """
+        Roda em paralelo ao `_play_loop`, baixando com antecedência a
+        próxima música da fila (uma de cada vez — `_prontos` tem
+        `maxsize=1`). Enquanto a música 1 está tocando, este loop já
+        baixa a música 2 e a deixa pronta; assim que a 1 termina, a 2
+        toca na hora, sem espera de download.
+        """
         while True:
-            if not self.fila or self.current_track is not None:
+            if not self.fila or self._prontos.full():
+                await asyncio.sleep(0.5)
+                continue
+
+            link_usuario = self.fila.pop(0)
+            geracao_no_inicio = self._geracao
+
+            item = await self._preparar_musica(link_usuario)
+
+            if item is None:
+                continue
+
+            if self._geracao != geracao_no_inicio:
+                # Houve um `!stop` enquanto isso baixava: descarta.
+                caminho = item.get("caminho")
+                if item.get("temporario") and caminho and os.path.exists(caminho):
+                    try:
+                        os.remove(caminho)
+                    except Exception:
+                        pass
+                continue
+
+            await self._prontos.put(item)
+
+    async def _play_loop(self):
+        """
+        Loop principal de reprodução: só consome itens já preparados
+        (baixados) por `_prepare_loop` — não baixa nada diretamente.
+        """
+        while True:
+            if self.current_track is not None:
+                await asyncio.sleep(0.5)
+                continue
+
+            if self._prontos.empty():
                 if (
                     not self.fila
-                    and self.current_track is None
                     and self._ja_tocou_alguma_musica
                     and not self._avisou_fila_vazia
                 ):
                     self._avisou_fila_vazia = True
                     await self._enviar_texto("🏁 A fila acabou! Manda mais música com `!play`.")
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.3)
                 continue
 
             self._avisou_fila_vazia = False
-            link_usuario = self.fila.pop(0)
-            url_sem_query = link_usuario.split('?')[0].lower()
-            titulo_stream = None
-
-            if url_sem_query.endswith(self.EXTENSOES_ARQUIVO_FINITO):
-                # Link direto para um arquivo de áudio: streama sem baixar.
-                info = None
-                eh_ao_vivo = True
-                titulo_stream = os.path.basename(url_sem_query) or "Arquivo de Áudio"
-            else:
-                info = await self._extrair_info(link_usuario)
-
-                if info is not None:
-                    # Se o yt-dlp não retorna duração, ou marca como
-                    # live_status, é uma transmissão contínua/infinita
-                    # (rádio) — não pode (nem faz sentido) ser baixada.
-                    eh_ao_vivo = (
-                        bool(info.get('is_live'))
-                        or info.get('live_status') in ('is_live', 'is_upcoming', 'post_live')
-                        or not info.get('duration')
-                    )
-                else:
-                    # yt-dlp não conseguiu extrair metadados: provavelmente
-                    # é uma URL de stream de áudio puro sem suporte
-                    # específico. Cai na heurística por extensão como
-                    # último recurso.
-                    eh_ao_vivo = (
-                        link_usuario.endswith(('.m3u', '.m3u8', '.pls', '.aac'))
-                        or ":80" in link_usuario
-                    )
-
-            if eh_ao_vivo:
-                caminho_ou_url = (info.get('url') if info else None) or link_usuario
-                titulo = (info.get('title') if info else None) or titulo_stream or "Rádio Ao Vivo"
-                eh_temporario = False
-            else:
-                caminho_ou_url, titulo = await self._baixar_audio_local(link_usuario)
-                eh_temporario = True
-
-            if not caminho_ou_url:
-                continue
+            item = await self._prontos.get()
+            caminho_ou_url = item["caminho"]
+            titulo = item["titulo"]
+            eh_temporario = item["temporario"]
 
             try:
                 loop = asyncio.get_running_loop()
