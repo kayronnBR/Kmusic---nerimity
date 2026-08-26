@@ -43,6 +43,20 @@ USUARIOS_BLOQUEADOS = set()
 PEER_CONNECT_TIMEOUT = 15
 LIMITE_PLAYLIST = 50
 
+# Áudio PCM mono a 48kHz em blocos de 20ms ocupa pouquíssima memória
+# (~1.9KB por bloco, ~23MB pra uma música de 4 minutos), então mesmo
+# num aparelho com 2GB de RAM dá pra guardar a música inteira antes de tocar.
+#
+# Com a placa de rede ruim, carregar 100% antes de começar evita qualquer
+# chance de faltar dado NO MEIO da reprodução (o preço é só esperar mais
+# no início). Por isso o alvo de pré-buffer é igual ao máximo: só libera
+# pra tocar quando a música terminar de baixar por completo.
+BUFFER_FRAMES_MAXIMO = 40000      # ~13 minutos de áudio decodificado guardado por música
+FRAMES_PREBUFFER_ALVO = BUFFER_FRAMES_MAXIMO  # espera carregar 100% antes de tocar
+TIMEOUT_PREBUFFER = 180.0         # tempo máx. de espera pelo carregamento completo
+TIMEOUT_CURTO_RECV = 2.0          # cada tentativa de leitura espera no máx. 2s
+TIMEOUT_TOTAL_TRAVADO = 20.0      # tempo total sem áudio até desistir e pular
+
 # Servidores STUN públicos e estáveis (removidos os servidores TURN com credenciais expiradas)
 ICE_SERVERS = [
     RTCIceServer(urls="stun:stun.l.google.com:19302"),
@@ -248,7 +262,14 @@ async def extrair_links_da_lista(texto: str) -> List[ItemMusica]:
 
 
 class AudioFileSource:
-    def __init__(self, url: str, loop: asyncio.AbstractEventLoop, buffer_frames: int = 50, headers: Optional[str] = None):
+    def __init__(
+        self,
+        url: str,
+        loop: asyncio.AbstractEventLoop,
+        buffer_frames: int = BUFFER_FRAMES_MAXIMO,
+        alvo_prebuffer: int = FRAMES_PREBUFFER_ALVO,
+        headers: Optional[str] = None,
+    ):
         self.url = url
         self.loop = loop
         self.headers = headers
@@ -256,10 +277,25 @@ class AudioFileSource:
         self._resampler = av.AudioResampler(format="s16", layout="mono", rate=48000)
         self._stopped = False
         self._finished = False
+        self._alvo_prebuffer = min(alvo_prebuffer, buffer_frames)
+        # Sinalizado assim que o buffer atinge o alvo, o arquivo termina de baixar,
+        # ou ocorre um erro — o que acontecer primeiro.
+        self.pronto_evento = asyncio.Event()
         self._thread = threading.Thread(
             target=self._run, daemon=True, name=f"audio-decode-{id(self)}"
         )
         self._thread.start()
+
+    async def aguardar_pronto(self, timeout: float = TIMEOUT_PREBUFFER) -> None:
+        try:
+            await asyncio.wait_for(self.pronto_evento.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            # Não travou de vez: apenas seguimos com o que já tiver no buffer.
+            pass
+
+    def _sinalizar_pronto_se_necessario(self) -> None:
+        if not self.pronto_evento.is_set() and self.queue.qsize() >= self._alvo_prebuffer:
+            self.loop.call_soon_threadsafe(self.pronto_evento.set)
 
     def stop(self) -> None:
         self._stopped = True
@@ -272,7 +308,14 @@ class AudioFileSource:
     def _run(self) -> None:
         container = None
         try:
-            opcoes = {'timeout': '8000000', 'rw_timeout': '12000000'}
+            opcoes = {
+                'timeout': '8000000',
+                'rw_timeout': '12000000',
+                'reconnect': '1',
+                'reconnect_streamed': '1',
+                'reconnect_on_network_error': '1',
+                'reconnect_delay_max': '5',
+            }
             if self.headers:
                 opcoes['headers'] = self.headers
             container = av.open(
@@ -301,6 +344,7 @@ class AudioFileSource:
                     if self._stopped:
                         break
                     self.loop.call_soon_threadsafe(self.queue.put_nowait, r_frame)
+                    self._sinalizar_pronto_se_necessario()
 
                 if self._stopped:
                     break
@@ -316,6 +360,13 @@ class AudioFileSource:
                 self.loop.call_soon_threadsafe(self.queue.put_nowait, None)
             except Exception:
                 pass
+            # Garante que quem estiver esperando o pré-buffer não fique preso
+            # para sempre se a música for curta, falhar ou já tiver terminado.
+            if not self.pronto_evento.is_set():
+                try:
+                    self.loop.call_soon_threadsafe(self.pronto_evento.set)
+                except Exception:
+                    pass
 
     async def recv(self, timeout: Optional[float] = None):
         if self._finished:
@@ -437,9 +488,15 @@ class VoiceSession:
 
             try:
                 loop = asyncio.get_running_loop()
-                self.current_track = AudioFileSource(
+                nova_faixa = AudioFileSource(
                     musica_atual["url"], loop, headers=musica_atual.get("headers")
                 )
+                await self._enviar_texto("⏳ **Carregando música...**")
+                # Espera carregar 100% antes de liberar pro pump loop tocar,
+                # pra absorver as variações de velocidade do link (ex: Google Drive)
+                # sem engasgar/acelerar a música depois.
+                await nova_faixa.aguardar_pronto()
+                self.current_track = nova_faixa
                 self._ja_tocou_alguma_musica = True
                 await self._enviar_texto("▶️ **Tocando próxima música...**")
             except Exception as e:
@@ -452,7 +509,17 @@ class VoiceSession:
         pts = 0
         start_time = time.perf_counter()
 
+        # Controla há quanto tempo estamos sem receber áudio de verdade da
+        # faixa atual, pra só desistir dela depois de um tempo total travado
+        # (em vez de um único timeout gigante que engasgava tudo de uma vez).
+        faixa_referencia = None
+        travado_desde: Optional[float] = None
+
         while True:
+            if self.current_track is not faixa_referencia:
+                faixa_referencia = self.current_track
+                travado_desde = None
+
             now = time.perf_counter()
             target_time = start_time + (pts / 48000.0)
             wait_time = target_time - now
@@ -466,16 +533,25 @@ class VoiceSession:
                 frame = None
                 if self.current_track:
                     try:
-                        frame = await self.current_track.recv(timeout=20.0)
+                        frame = await self.current_track.recv(timeout=TIMEOUT_CURTO_RECV)
+                        travado_desde = None
                     except asyncio.TimeoutError:
-                        print("⏱️ Música travada por mais de 20s, pulando automaticamente.")
-                        self.finalizar_musica_atual()
-                        asyncio.create_task(
-                            self._enviar_texto("⚠️ Uma música travou ao carregar e foi pulada automaticamente.")
-                        )
+                        if travado_desde is None:
+                            travado_desde = time.perf_counter()
+                        elif time.perf_counter() - travado_desde >= TIMEOUT_TOTAL_TRAVADO:
+                            print(f"⏱️ Música travada por mais de {TIMEOUT_TOTAL_TRAVADO:.0f}s, pulando automaticamente.")
+                            self.finalizar_musica_atual()
+                            travado_desde = None
+                            asyncio.create_task(
+                                self._enviar_texto("⚠️ Uma música travou ao carregar e foi pulada automaticamente.")
+                            )
+                        # Ainda dentro da tolerância: só preenche este trecho
+                        # com silêncio e tenta de novo no próximo bloco,
+                        # mantendo o ritmo/relógio sem saltos.
                     except Exception as e:
                         print(f"Erro ao ler áudio: {e}")
                         self.finalizar_musica_atual()
+                        travado_desde = None
 
                 if frame is not None:
                     try:
@@ -483,7 +559,8 @@ class VoiceSession:
                     except Exception:
                         pass
                 else:
-                    if self.current_track is not None:
+                    if self.current_track is not None and travado_desde is None:
+                        # A faixa terminou de verdade (recv devolveu None sem timeout).
                         self.finalizar_musica_atual()
                     silence_data = np.zeros((1, FRAME_SIZE), dtype=np.int16)
                     silence_frame = av.AudioFrame.from_ndarray(silence_data, format="s16", layout="mono")
