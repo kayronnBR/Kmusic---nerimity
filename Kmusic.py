@@ -5,8 +5,10 @@ Mensagens simplificadas de reprodução e aviso de conexão no !play.
 
 import asyncio
 import fractions
-import gc
+import json
+import random
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -29,6 +31,8 @@ from nerimity_sdk import Bot
 # --- CONFIGURAÇÕES ---
 TOKEN = "SEU_TOKEN_DO_BOT_AQUI"
 
+EXTENSOES_AUDIO = ('.mp3', '.wav', '.m4a', '.flac', '.ogg', '.opus', '.wma', '.aac', '.webm')
+
 COMANDO_CONFIG = "!config"
 COMANDO_SAIR = "!sair"
 COMANDO_MESTRE = "!master"
@@ -39,27 +43,25 @@ USUARIOS_BLOQUEADOS = set()
 PEER_CONNECT_TIMEOUT = 15
 LIMITE_PLAYLIST = 50
 
+# Servidores STUN públicos e estáveis (removidos os servidores TURN com credenciais expiradas)
 ICE_SERVERS = [
     RTCIceServer(urls="stun:stun.l.google.com:19302"),
-    RTCIceServer(urls="stun:stun.relay.metered.ca:80"),
-    RTCIceServer(
-        urls="turn:a.relay.metered.ca:80",
-        username="b9fafdffb3c428131bd9ae10",
-        credential="DTk2mXfXv4kJYPvD",
-    ),
+    RTCIceServer(urls="stun:stun1.l.google.com:19302"),
+    RTCIceServer(urls="stun:stun2.l.google.com:19302"),
 ]
 
 bot = Bot(token=TOKEN)
 
 
-class ItemMusica(TypedDict):
+class ItemMusica(TypedDict, total=False):
     url: str
+    headers: str
 
 
 def _obter_html_gdrive(folder_id: str) -> str:
     url = f"https://drive.google.com/embeddedfolderview?id={folder_id}"
     req = urllib.request.Request(
-        url, 
+        url,
         headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
@@ -68,39 +70,153 @@ def _obter_html_gdrive(folder_id: str) -> str:
         return response.read().decode('utf-8', errors='ignore')
 
 
+def _resolver_download_gdrive(file_id: str) -> ItemMusica:
+    url_base = f"https://drive.google.com/uc?export=download&id={file_id}"
+    headers_req = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    try:
+        cookiejar = urllib.request.HTTPCookieProcessor()
+        opener = urllib.request.build_opener(cookiejar)
+        req = urllib.request.Request(url_base, headers=headers_req)
+        with opener.open(req, timeout=12) as resp:
+            content_type = resp.headers.get('Content-Type', '')
+            if 'text/html' not in content_type:
+                return {"url": url_base}
+            html = resp.read().decode('utf-8', errors='ignore')
+
+        cookie_header = "; ".join(f"{c.name}={c.value}" for c in cookiejar.cookiejar)
+
+        match_form = re.search(r'action="(https://drive\.usercontent\.google\.com/download[^"]+)"', html)
+        if match_form:
+            form_url = match_form.group(1).replace('&amp;', '&')
+            campos = dict(re.findall(r'<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"', html))
+            if campos:
+                sep = '&' if '?' in form_url else '?'
+                form_url = f"{form_url}{sep}{urllib.parse.urlencode(campos)}"
+            item: ItemMusica = {"url": form_url}
+            if cookie_header:
+                item["headers"] = f"Cookie: {cookie_header}\r\n"
+            return item
+
+        match_confirm = re.search(r'confirm=([0-9A-Za-z_-]+)', html)
+        if match_confirm:
+            item = {"url": f"{url_base}&confirm={match_confirm.group(1)}"}
+            if cookie_header:
+                item["headers"] = f"Cookie: {cookie_header}\r\n"
+            return item
+    except Exception as e:
+        print(f"Aviso: não consegui contornar a página de aviso do Drive para {file_id}: {e}")
+
+    return {"url": url_base}
+
+
 async def extrair_todos_links_gdrive(candidato: str) -> List[ItemMusica]:
     match_pasta = re.search(r'folders/([a-zA-Z0-9_-]+)', candidato)
     if not match_pasta:
         return []
     folder_id = match_pasta.group(1)
-    
+
     try:
         html = await asyncio.to_thread(_obter_html_gdrive, folder_id)
-        resultado: List[ItemMusica] = []
+        ids: List[str] = []
         vistos = set()
 
         padrao_json = r'\["([a-zA-Z0-9_-]{25,})"'
         for fid in re.findall(padrao_json, html):
             if fid not in vistos:
                 vistos.add(fid)
-                resultado.append({"url": f"https://drive.google.com/uc?export=download&id={fid}"})
+                ids.append(fid)
 
-        if not resultado:
+        if not ids:
             padrao_generico = r'/file/d/([a-zA-Z0-9_-]+)'
             ids = list(dict.fromkeys(re.findall(padrao_generico, html)))
-            for fid in ids:
-                resultado.append({"url": f"https://drive.google.com/uc?export=download&id={fid}"})
+
+        resultado = await asyncio.gather(
+            *(asyncio.to_thread(_resolver_download_gdrive, fid) for fid in ids)
+        )
+        return list(resultado)
+    except Exception as e:
+        print(f"Erro ao ler pasta do Drive: {e}")
+        return []
+
+
+def _obter_html_dropbox_pasta(url_pasta: str) -> str:
+    req = urllib.request.Request(
+        url_pasta,
+        headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
+        return response.read().decode('utf-8', errors='ignore')
+
+
+async def extrair_todos_links_dropbox_pasta(url_pasta: str) -> List[ItemMusica]:
+    try:
+        html = await asyncio.to_thread(_obter_html_dropbox_pasta, url_pasta)
+        resultado: List[ItemMusica] = []
+        vistos = set()
+        ext_regex = "|".join(e.lstrip(".") for e in EXTENSOES_AUDIO)
+
+        padrao_scl = rf'(/scl/fi/[a-zA-Z0-9]+/[^"\'?\s]+\.(?:{ext_regex}))\?[^"\'\s]*?rlkey=([a-zA-Z0-9]+)'
+        for caminho, rlkey in re.findall(padrao_scl, html, re.IGNORECASE):
+            if caminho in vistos:
+                continue
+            vistos.add(caminho)
+            resultado.append({"url": f"https://www.dropbox.com{caminho}?rlkey={rlkey}&dl=1"})
+
+        padrao_s = rf'(/s/[a-zA-Z0-9]+/[^"\'?\s]+\.(?:{ext_regex}))'
+        for caminho in re.findall(padrao_s, html, re.IGNORECASE):
+            if caminho in vistos:
+                continue
+            vistos.add(caminho)
+            resultado.append({"url": f"https://www.dropbox.com{caminho}?dl=1"})
 
         return resultado
     except Exception as e:
-        print(f"Erro ao ler pasta do Drive: {e}")
+        print(f"Erro ao ler pasta do Dropbox: {e}")
+        return []
+
+
+def _obter_metadata_archive(identifier: str) -> dict:
+    url = f"https://archive.org/metadata/{identifier}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
+        return json.loads(response.read().decode('utf-8', errors='ignore'))
+
+
+async def extrair_todos_links_archive(candidato: str) -> List[ItemMusica]:
+    match = re.search(r'archive\.org/(?:details|download)/([a-zA-Z0-9_.\-]+)', candidato)
+    if not match:
+        return []
+    identifier = match.group(1)
+
+    try:
+        data = await asyncio.to_thread(_obter_metadata_archive, identifier)
+        resultado: List[ItemMusica] = []
+        for f in data.get("files", []):
+            nome = f.get("name") or ""
+            formato = (f.get("format") or "").lower()
+            eh_audio = nome.lower().endswith(EXTENSOES_AUDIO) or "audio" in formato
+            if eh_audio:
+                url = f"https://archive.org/download/{identifier}/{urllib.parse.quote(nome)}"
+                resultado.append({"url": url})
+        return resultado
+    except Exception as e:
+        print(f"Erro ao ler item do Internet Archive: {e}")
         return []
 
 
 async def extrair_links_da_lista(texto: str) -> List[ItemMusica]:
     candidatos = re.split(r'[\s,]+', texto.strip())
     links_prontos: List[ItemMusica] = []
-    
+
     for c in candidatos:
         if c.startswith(('http://', 'https://')):
             if "drive.google.com" in c and "folders/" in c:
@@ -110,35 +226,60 @@ async def extrair_links_da_lista(texto: str) -> List[ItemMusica]:
                 match = re.search(r'/d/([a-zA-Z0-9_-]+)', c)
                 if match:
                     fid = match.group(1)
-                    links_prontos.append({"url": f"https://drive.google.com/uc?export=download&id={fid}"})
+                    item = await asyncio.to_thread(_resolver_download_gdrive, fid)
+                    links_prontos.append(item)
+            elif "dropbox.com" in c and ("/sh/" in c or "/scl/fo/" in c):
+                itens = await extrair_todos_links_dropbox_pasta(c)
+                links_prontos.extend(itens)
             elif "dropbox.com" in c:
                 url_final = c.replace("?dl=0", "?dl=1")
                 if "&dl=1" not in url_final and "?dl=1" not in url_final:
                     url_final += "&dl=1" if "?" in url_final else "?dl=1"
                 links_prontos.append({"url": url_final})
+            elif "archive.org" in c and any(c.split('?')[0].lower().endswith(ext) for ext in EXTENSOES_AUDIO):
+                links_prontos.append({"url": c})
+            elif "archive.org" in c and ("/details/" in c or "/download/" in c):
+                itens = await extrair_todos_links_archive(c)
+                links_prontos.extend(itens)
             else:
                 links_prontos.append({"url": c})
-            
+
     return links_prontos
 
 
 class AudioFileSource:
-    def __init__(self, url: str, loop: asyncio.AbstractEventLoop, buffer_frames: int = 50):
+    def __init__(self, url: str, loop: asyncio.AbstractEventLoop, buffer_frames: int = 50, headers: Optional[str] = None):
         self.url = url
         self.loop = loop
+        self.headers = headers
         self.queue: "asyncio.Queue" = asyncio.Queue(maxsize=buffer_frames)
         self._resampler = av.AudioResampler(format="s16", layout="mono", rate=48000)
         self._stopped = False
         self._finished = False
-        self._future = loop.run_in_executor(None, self._run)
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"audio-decode-{id(self)}"
+        )
+        self._thread.start()
 
     def stop(self) -> None:
         self._stopped = True
+        try:
+            while True:
+                self.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
 
     def _run(self) -> None:
         container = None
         try:
-            container = av.open(self.url, options={'timeout': '5000000'})
+            opcoes = {'timeout': '8000000', 'rw_timeout': '12000000'}
+            if self.headers:
+                opcoes['headers'] = self.headers
+            container = av.open(
+                self.url,
+                timeout=(8.0, 12.0),
+                options=opcoes,
+            )
             stream = next((s for s in container.streams if s.type == "audio"), None)
             if stream is None:
                 return
@@ -154,13 +295,17 @@ class AudioFileSource:
                 for r_frame in resampled_frames:
                     if self._stopped:
                         break
-                    fut = asyncio.run_coroutine_threadsafe(self.queue.put(r_frame), self.loop)
-                    fut.result()
+                    # Envia para a fila sem bloquear a thread esperando retornos
+                    while not self._stopped and self.queue.qsize() >= self.queue.maxsize:
+                        time.sleep(0.01)
+                    if self._stopped:
+                        break
+                    self.loop.call_soon_threadsafe(self.queue.put_nowait, r_frame)
 
                 if self._stopped:
                     break
         except Exception as e:
-            print(f"Erro ao decodificar link: {e}")
+            print(f"Erro ao decodificar link ({self.url}): {e}")
         finally:
             if container is not None:
                 try:
@@ -168,14 +313,17 @@ class AudioFileSource:
                 except Exception:
                     pass
             try:
-                asyncio.run_coroutine_threadsafe(self.queue.put(None), self.loop)
+                self.loop.call_soon_threadsafe(self.queue.put_nowait, None)
             except Exception:
                 pass
 
-    async def recv(self):
+    async def recv(self, timeout: Optional[float] = None):
         if self._finished:
             return None
-        frame = await self.queue.get()
+        if timeout:
+            frame = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+        else:
+            frame = await self.queue.get()
         if frame is None:
             self._finished = True
             return None
@@ -254,7 +402,6 @@ class VoiceSession:
             except Exception:
                 pass
         self.current_track = None
-        gc.collect()
 
     def pular_musica(self):
         self.finalizar_musica_atual()
@@ -290,7 +437,9 @@ class VoiceSession:
 
             try:
                 loop = asyncio.get_running_loop()
-                self.current_track = AudioFileSource(musica_atual["url"], loop)
+                self.current_track = AudioFileSource(
+                    musica_atual["url"], loop, headers=musica_atual.get("headers")
+                )
                 self._ja_tocou_alguma_musica = True
                 await self._enviar_texto("▶️ **Tocando próxima música...**")
             except Exception as e:
@@ -317,8 +466,15 @@ class VoiceSession:
                 frame = None
                 if self.current_track:
                     try:
-                        frame = await self.current_track.recv()
-                    except Exception:
+                        frame = await self.current_track.recv(timeout=20.0)
+                    except asyncio.TimeoutError:
+                        print("⏱️ Música travada por mais de 20s, pulando automaticamente.")
+                        self.finalizar_musica_atual()
+                        asyncio.create_task(
+                            self._enviar_texto("⚠️ Uma música travou ao carregar e foi pulada automaticamente.")
+                        )
+                    except Exception as e:
+                        print(f"Erro ao ler áudio: {e}")
                         self.finalizar_musica_atual()
 
                 if frame is not None:
@@ -379,16 +535,28 @@ class VoiceSession:
             await pc.close()
 
     async def _enviar_sinal(self, to_user_id: str, signal: dict) -> None:
-        await self.bot._gateway.emit("voice:signal_send", {"channelId": self.channel_id, "toUserId": to_user_id, "signal": signal})
+        try:
+            await asyncio.wait_for(
+                self.bot._gateway.emit(
+                    "voice:signal_send",
+                    {"channelId": self.channel_id, "toUserId": to_user_id, "signal": signal},
+                ),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            print(f"⚠️ Timeout ao enviar sinal WebRTC para {to_user_id}.")
 
     async def ao_usuario_entrar(self, payload: dict) -> None:
         if not self._connected: return
         user_id = payload.get("userId")
         if not user_id or user_id == self.my_user_id or user_id in self.peers: return
-        pc = self._nova_conexao(user_id)
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        await self._enviar_sinal(user_id, {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp})
+        try:
+            pc = self._nova_conexao(user_id)
+            offer = await asyncio.wait_for(pc.createOffer(), timeout=10.0)
+            await asyncio.wait_for(pc.setLocalDescription(offer), timeout=10.0)
+            await self._enviar_sinal(user_id, {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp})
+        except Exception as e:
+            print(f"⚠️ Erro ao negociar conexão de voz com {user_id}: {e}")
 
     async def ao_usuario_sair(self, payload: dict) -> None:
         user_id = payload.get("userId")
@@ -405,10 +573,10 @@ class VoiceSession:
             if "sdp" in signal:
                 if pc is None: pc = self._nova_conexao(from_user_id)
                 desc = RTCSessionDescription(sdp=signal["sdp"], type=signal["type"])
-                await pc.setRemoteDescription(desc)
+                await asyncio.wait_for(pc.setRemoteDescription(desc), timeout=10.0)
                 if signal["type"] == "offer":
-                    answer = await pc.createAnswer()
-                    await pc.setLocalDescription(answer)
+                    answer = await asyncio.wait_for(pc.createAnswer(), timeout=10.0)
+                    await asyncio.wait_for(pc.setLocalDescription(answer), timeout=10.0)
                     await self._enviar_sinal(from_user_id, {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp})
             elif signal.get("candidate"):
                 if pc is None: return
@@ -493,6 +661,8 @@ class GerenciadorSalas:
             dm_channel_id,
             "🎉 Bot conectado com sucesso!\n\nUse no servidor:\n"
             "• `!play [link/pasta]` - Adiciona músicas\n"
+            "• `!play embaralhar [link/pasta]` - Embaralha e escolhe até "
+            f"{LIMITE_PLAYLIST} músicas aleatórias\n"
             "• `!skip` - Pula a música\n"
             "• `!stop` - Para a música\n"
             "• `!sair` - Desconecta"
@@ -538,6 +708,16 @@ class GerenciadorSalas:
 gerenciador = GerenciadorSalas(bot)
 
 
+def _tarefa_segura(coro, nome: str = "handler") -> None:
+    async def _executar():
+        try:
+            await coro
+        except Exception as e:
+            print(f"⚠️ Erro no handler '{nome}': {e}")
+
+    asyncio.create_task(_executar())
+
+
 @bot.on("ready")
 async def on_ready(me):
     gerenciador.my_user_id = getattr(me, "id", None)
@@ -546,20 +726,27 @@ async def on_ready(me):
 @bot.on("voice:user_joined")
 async def on_voice_user_joined(payload):
     sala = gerenciador.sala_por_canal_voz(str(payload.get("channelId", "")))
-    if sala: await sala.voice_session.ao_usuario_entrar(payload)
+    if sala:
+        _tarefa_segura(sala.voice_session.ao_usuario_entrar(payload), "voice:user_joined")
 
 @bot.on("voice:user_left")
 async def on_voice_user_left(payload):
     sala = gerenciador.sala_por_canal_voz(str(payload.get("channelId", "")))
-    if sala: await sala.voice_session.ao_usuario_sair(payload)
+    if sala:
+        _tarefa_segura(sala.voice_session.ao_usuario_sair(payload), "voice:user_left")
 
 @bot.on("voice:signal_received")
 async def on_voice_signal(payload):
     sala = gerenciador.sala_por_canal_voz(str(payload.get("channelId", "")))
-    if sala: await sala.voice_session.ao_receber_sinal(payload)
+    if sala:
+        _tarefa_segura(sala.voice_session.ao_receber_sinal(payload), "voice:signal_received")
 
 @bot.on("message:created")
 async def on_message(event):
+    _tarefa_segura(_processar_mensagem(event), "message:created")
+
+
+async def _processar_mensagem(event):
     msg = event.message
     channel_id = str(msg.channel_id)
     conteudo = getattr(msg, "content", "") or ""
@@ -603,9 +790,24 @@ async def on_message(event):
     if sala:
         if comando in ["!play", "!tocar", "!playlist"]:
             if argumento:
-                itens = await extrair_links_da_lista(argumento)
+                primeira_palavra, _, resto = argumento.partition(" ")
+                embaralhar = primeira_palavra.lower() in ("embaralhar", "aleatorio", "aleatório", "shuffle")
+                argumento_link = resto.strip() if embaralhar else argumento
+
+                if not argumento_link:
+                    await bot.rest.create_message(
+                        channel_id,
+                        "⚠️ Envie um link ou pasta junto com o comando."
+                    )
+                    return
+
+                itens = await extrair_links_da_lista(argumento_link)
                 if not itens:
-                    itens = [{"url": argumento.strip()}]
+                    itens = [{"url": argumento_link.strip()}]
+
+                total_encontrado = len(itens)
+                if embaralhar:
+                    random.shuffle(itens)
 
                 cortado = len(itens) > LIMITE_PLAYLIST
                 if cortado:
@@ -613,11 +815,17 @@ async def on_message(event):
 
                 for item in itens:
                     sala.voice_session.adicionar_musica(item)
-                
-                aviso_corte = f" (Máximo de {LIMITE_PLAYLIST} por vez)" if cortado else ""
+
+                aviso_corte = (
+                    f" ({total_encontrado} encontradas, {LIMITE_PLAYLIST} escolhidas aleatoriamente)"
+                    if cortado and embaralhar
+                    else f" (Máximo de {LIMITE_PLAYLIST} por vez)" if cortado
+                    else ""
+                )
+                aviso_embaralhado = " 🔀 embaralhadas!" if embaralhar and not cortado else ""
                 await bot.rest.create_message(
                     channel_id,
-                    f"🎶 {len(itens)} música(s) adicionada(s) à fila!{aviso_corte}\n"
+                    f"🎶 {len(itens)} música(s) adicionada(s) à fila!{aviso_corte}{aviso_embaralhado}\n"
                     f"⚠️ *Caso não esteja escutando a música, saia e entre na ligação.*"
                 )
             else:
